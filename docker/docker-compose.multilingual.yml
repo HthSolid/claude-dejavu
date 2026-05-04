@@ -1,0 +1,52 @@
+# claude-dejavu — multilingual stack (100+ languages, slower on CPU)
+# Identical layout to docker-compose.minimal.yml but uses
+# multilingual-e5-large-instruct (~2.2 GB image).
+#
+# Use this if Claude sessions contain non-English content.
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: claude-dejavu-postgres
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASS:-postgres}
+      POSTGRES_DB: ${PG_DB:-claude_dejavu}
+    ports:
+      - "${PG_PORT:-5454}:5432"
+    volumes:
+      - claude-dejavu-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 5
+
+  weaviate:
+    image: semitechnologies/weaviate:1.27.5
+    container_name: claude-dejavu-weaviate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: text2vec-transformers
+      ENABLE_MODULES: text2vec-transformers
+      TRANSFORMERS_INFERENCE_API: http://transformers:8080
+      CLUSTER_HOSTNAME: node1
+    ports:
+      - "${WV_PORT:-8889}:8080"
+      - "${WV_GRPC_PORT:-50052}:50051"
+    volumes:
+      - claude-dejavu-weaviate:/var/lib/weaviate
+
+  transformers:
+    image: semitechnologies/transformers-inference:intfloat-multilingual-e5-large-instruct
+    container_name: claude-dejavu-transformers
+    environment:
+      ENABLE_CUDA: "0"
+
+volumes:
+  claude-dejavu-postgres:
+  claude-dejavu-weaviate:

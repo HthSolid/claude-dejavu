@@ -1,0 +1,13 @@
+# Keep LF on shell scripts and other text where CRLF would break execution.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.sql   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Hook scripts and bin entries (no extension) must be LF on every platform
+# or the bash shebang fails on Linux/macOS.
+bin/claude-dejavu       text eol=lf
+bin/claude-dejavu-mcp   text eol=lf

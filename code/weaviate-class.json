@@ -1,0 +1,24 @@
+{
+  "class": "ClaudeDejavuTurn",
+  "description": "One turn (user prompt or assistant text) from a Claude Code session.",
+  "vectorizer": "text2vec-transformers",
+  "moduleConfig": {
+    "text2vec-transformers": {
+      "poolingStrategy": "masked_mean",
+      "vectorizeClassName": false
+    }
+  },
+  "invertedIndexConfig": {
+    "bm25": {"b": 0.75, "k1": 1.2}
+  },
+  "properties": [
+    {"name": "session_id",   "dataType": ["text"], "tokenization": "field", "moduleConfig": {"text2vec-transformers": {"skip": true}}},
+    {"name": "turn_id",      "dataType": ["int"]},
+    {"name": "project_slug", "dataType": ["text"], "tokenization": "field", "moduleConfig": {"text2vec-transformers": {"skip": true}}},
+    {"name": "role",         "dataType": ["text"], "tokenization": "field", "moduleConfig": {"text2vec-transformers": {"skip": true}}},
+    {"name": "content",      "dataType": ["text"], "tokenization": "word"},
+    {"name": "ts",           "dataType": ["date"]},
+    {"name": "model",        "dataType": ["text"], "tokenization": "field", "moduleConfig": {"text2vec-transformers": {"skip": true}}},
+    {"name": "ai_title",     "dataType": ["text"], "tokenization": "word"}
+  ]
+}

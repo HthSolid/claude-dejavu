@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# This workflow uses ONLY internal context (matrix, github.workspace) — no
+# untrusted user input from issue/PR bodies, commit messages, branch names,
+# etc. is consumed in run: blocks. Safe per
+# https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+jobs:
+  smoke-linux:
+    name: smoke (ubuntu, python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12']
+    # NOTE: Postgres stays in `services:` (the image is ~150 MB, fits the
+    # default disk budget). Weaviate + transformers-inference are
+    # started manually in steps below so we can free disk space FIRST —
+    # the services block runs before any step, and the transformers
+    # image (~5 GB with CUDA libs) doesn't fit the default ~14 GB free
+    # space on ubuntu-latest.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Free disk space (pre-installed Android/Haskell/.NET)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+      - name: Disk space after cleanup
+        run: df -h /
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install postgresql-client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+      - name: Start Weaviate + transformers (after disk-space cleanup)
+        run: |
+          docker network create dejavu-ci || true
+          docker run -d --name transformers --network dejavu-ci \
+            -e ENABLE_CUDA=0 \
+            semitechnologies/transformers-inference:sentence-transformers-all-MiniLM-L6-v2
+          docker run -d --name weaviate --network dejavu-ci \
+            -p 8080:8080 \
+            -e QUERY_DEFAULTS_LIMIT=25 \
+            -e AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
+            -e PERSISTENCE_DATA_PATH=/var/lib/weaviate \
+            -e DEFAULT_VECTORIZER_MODULE=text2vec-transformers \
+            -e ENABLE_MODULES=text2vec-transformers \
+            -e TRANSFORMERS_INFERENCE_API=http://transformers:8080 \
+            -e CLUSTER_HOSTNAME=node1 \
+            semitechnologies/weaviate:1.27.5
+          df -h /
+      - name: Wait for Weaviate to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/v1/meta >/dev/null; then
+              echo "Weaviate ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Weaviate did not become ready"
+          docker logs weaviate || true
+          docker logs transformers || true
+          exit 1
+      - name: Run smoke test
+        env:
+          PG_HOST: localhost
+          PG_PORT: '5432'
+          PG_USER: postgres
+          PG_PASS: postgres
+          WV_URL: http://localhost:8080
+          CLAUDE_DEJAVU_PLUGIN_ROOT: ${{ github.workspace }}
+          CLAUDE_DEJAVU_SANDBOX: /tmp/dejavu-smoke-ci
+        run: python3 tests/smoke.py
+
+  smoke-macos:
+    name: smoke (macos)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install Postgres
+        run: |
+          brew install postgresql@16
+          brew services start postgresql@16
+          sleep 5
+          /opt/homebrew/opt/postgresql@16/bin/createuser -s postgres || true
+          /opt/homebrew/opt/postgresql@16/bin/psql -d postgres -c "ALTER USER postgres WITH PASSWORD 'postgres';"
+      - name: Start Weaviate via Docker
+        run: |
+          docker run -d --name weaviate \
+            -e QUERY_DEFAULTS_LIMIT=25 \
+            -e AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
+            -e DEFAULT_VECTORIZER_MODULE=text2vec-transformers \
+            -e ENABLE_MODULES=text2vec-transformers \
+            -e TRANSFORMERS_INFERENCE_API=http://transformers:8080 \
+            -e CLUSTER_HOSTNAME=node1 \
+            -p 8080:8080 \
+            semitechnologies/weaviate:1.27.5 || echo "weaviate start non-fatal"
+      - name: Smoke test (best-effort)
+        env:
+          PG_HOST: localhost
+          PG_PORT: '5432'
+          PG_USER: postgres
+          PG_PASS: postgres
+          WV_URL: http://localhost:8080
+          CLAUDE_DEJAVU_PLUGIN_ROOT: ${{ github.workspace }}
+        run: python3 tests/smoke.py || (echo "macOS smoke is non-blocking pending matrix stabilization"; true)
+
+  smoke-windows:
+    name: smoke (windows)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Note
+        shell: pwsh
+        run: Write-Host "Windows native CI is a follow-up. Use WSL or run install.py manually for now."
+
+  static:
+    name: static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Syntax check all .py files
+        run: |
+          set -e
+          for f in $(find . -name "*.py" -not -path "*/venv/*" -not -path "*/__pycache__/*"); do
+            python3 -c "import ast; ast.parse(open('$f').read())"
+            echo "  ok $f"
+          done
+      - name: Verify plugin.json + hooks.json + .mcp.json + schema.sql shape
+        run: |
+          python3 - <<'PY'
+          import json
+
+          # plugin.json: metadata only (per Claude Code plugin spec).
+          # hooks/commands/mcp live in their own files — see below.
+          d = json.load(open(".claude-plugin/plugin.json"))
+          for k in ("name", "version", "description", "license"):
+              assert k in d, f"plugin.json missing {k}"
+          assert isinstance(d.get("author"), dict), \
+              "plugin.json: author must be an object {name: ...}"
+          print("plugin.json OK:", d["name"], d["version"])
+
+          # hooks/hooks.json: nested EventName -> [{matcher, hooks: [...]}]
+          h = json.load(open("hooks/hooks.json"))
+          assert "hooks" in h, "hooks/hooks.json missing 'hooks' key"
+          for ev in ("SessionStart", "Stop", "SessionEnd", "PreToolUse"):
+              assert ev in h["hooks"], f"hooks.json missing event {ev}"
+          print("hooks/hooks.json OK:", list(h["hooks"]))
+
+          # .mcp.json at plugin root
+          m = json.load(open(".mcp.json"))
+          assert "mcpServers" in m and "claude-dejavu" in m["mcpServers"], \
+              ".mcp.json must declare mcpServers.claude-dejavu"
+          print(".mcp.json OK")
+
+          # schema.sql shape (extended for v0.3.0 symbol grounding tables)
+          s = open("code/schema.sql").read()
+          for needed in ("CREATE TABLE", "sessions", "turns", "tool_calls",
+                         "file_touches", "ingest_cursors", "workspaces",
+                         "symbols", "symbol_file_state", "correction_outcomes"):
+              assert needed in s, f"schema.sql missing {needed}"
+          print("schema.sql OK")
+          PY

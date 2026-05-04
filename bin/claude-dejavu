@@ -1,0 +1,10 @@
+#!/bin/bash
+# claude-dejavu CLI — thin wrapper around code/recall.py + bundled venv
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DATA_ROOT="${CLAUDE_DEJAVU_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-dejavu}"
+VENV="$DATA_ROOT/venv"
+if [ ! -x "$VENV/bin/python3" ]; then
+  echo "claude-dejavu: venv missing at $VENV — run scripts/install.sh first" >&2
+  exit 1
+fi
+exec "$VENV/bin/python3" "$SCRIPT_DIR/code/recall.py" "$@"

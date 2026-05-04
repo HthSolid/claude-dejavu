@@ -1,0 +1,66 @@
+{
+  "_comment": "Curated SDK environment-variable conventions. Maps NPM/PyPI/etc. package names to the canonical env vars the package's docs+code use. The dejavu rewriter accepts these as ACCEPT_SDK iff the project's package.json (or equivalent) actually depends on the package — they are 'real' even if not in .env.example. Source: package READMEs, official docs, .d.ts type definitions. Auto-scrape script: scripts/scrape_sdk_envs.py (TODO).",
+  "env": {
+    "@launchdarkly/node-server-sdk": ["LAUNCHDARKLY_SDK_KEY", "LD_SDK_KEY"],
+    "launchdarkly-node-server-sdk": ["LAUNCHDARKLY_SDK_KEY", "LD_SDK_KEY"],
+    "launchdarkly-js-client-sdk": ["LAUNCHDARKLY_CLIENT_ID", "LD_CLIENT_ID"],
+    "@launchdarkly/js-server-sdk-common": ["LAUNCHDARKLY_SDK_KEY", "LD_SDK_KEY"],
+
+    "aws-sdk": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"],
+    "@aws-sdk/client-s3": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION"],
+    "@aws-sdk/client-dynamodb": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION"],
+    "@aws-sdk/client-secrets-manager": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION"],
+    "boto3": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"],
+
+    "stripe": ["STRIPE_SECRET_KEY", "STRIPE_PUBLISHABLE_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_API_KEY"],
+
+    "@sentry/node": ["SENTRY_DSN", "SENTRY_AUTH_TOKEN", "SENTRY_RELEASE", "SENTRY_ENVIRONMENT", "SENTRY_ORG", "SENTRY_PROJECT"],
+    "@sentry/nextjs": ["SENTRY_DSN", "SENTRY_AUTH_TOKEN", "NEXT_PUBLIC_SENTRY_DSN"],
+    "sentry-sdk": ["SENTRY_DSN", "SENTRY_ENVIRONMENT", "SENTRY_RELEASE"],
+
+    "redis": ["REDIS_URL", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_USERNAME", "REDIS_DB"],
+    "ioredis": ["REDIS_URL", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_USERNAME"],
+    "@upstash/redis": ["UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
+
+    "pg": ["DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"],
+    "@neondatabase/serverless": ["DATABASE_URL", "NEON_DATABASE_URL", "POSTGRES_URL"],
+    "@vercel/postgres": ["POSTGRES_URL", "POSTGRES_PRISMA_URL", "POSTGRES_URL_NON_POOLING"],
+    "psycopg2": ["DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"],
+
+    "next": ["NODE_ENV", "PORT", "VERCEL_URL", "VERCEL_ENV", "NEXT_PUBLIC_VERCEL_URL", "NEXT_RUNTIME"],
+
+    "datadog": ["DD_API_KEY", "DD_APP_KEY", "DD_SITE", "DD_ENV", "DD_SERVICE", "DD_VERSION", "DD_TRACE_ENABLED"],
+    "datadog-lambda-js": ["DD_API_KEY", "DD_SITE", "DD_LOG_LEVEL"],
+    "ddtrace": ["DD_API_KEY", "DD_AGENT_HOST", "DD_TRACE_ENABLED", "DD_ENV", "DD_SERVICE", "DD_VERSION"],
+
+    "openai": ["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_BASE_URL", "OPENAI_PROJECT_ID"],
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "@anthropic-ai/sdk": ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+
+    "@supabase/supabase-js": ["SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY", "NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"],
+    "supabase": ["SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY"],
+
+    "twilio": ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_API_KEY", "TWILIO_API_SECRET"],
+
+    "@sendgrid/mail": ["SENDGRID_API_KEY"],
+    "resend": ["RESEND_API_KEY"],
+
+    "vercel": ["VERCEL_URL", "VERCEL_ENV", "VERCEL_REGION", "VERCEL_GIT_COMMIT_SHA"],
+
+    "node": ["NODE_ENV", "PORT", "HOST", "DEBUG", "LOG_LEVEL"],
+    "_universal": ["NODE_ENV", "PORT", "HOST", "DEBUG", "LOG_LEVEL", "CI", "GITHUB_ACTIONS", "GITHUB_TOKEN"]
+  },
+  "abbreviations": {
+    "LD": "LAUNCHDARKLY",
+    "DD": "DATADOG",
+    "PG": "POSTGRES",
+    "DB": "DATABASE",
+    "AWS": "AWS",
+    "GCP": "GCP",
+    "AZ": "AZURE",
+    "K8S": "KUBERNETES",
+    "CI": "CONTINUOUS_INTEGRATION",
+    "ENV": "ENVIRONMENT",
+    "AUTH": "AUTHENTICATION"
+  }
+}

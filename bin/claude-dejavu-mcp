@@ -1,0 +1,5 @@
+#!/bin/bash
+# Thin Linux/macOS shim that delegates to the cross-platform Python launcher.
+# .mcp.json invokes claude-dejavu-mcp.py directly via `python`; this file
+# exists for users who want to run the launcher by name from a terminal.
+exec python3 "$(dirname "$0")/claude-dejavu-mcp.py" "$@"

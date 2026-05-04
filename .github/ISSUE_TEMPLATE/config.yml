@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Question or open discussion
+    url: https://github.com/HthSolid/claude-dejavu/discussions
+    about: For "how do I…" questions, design discussions, or anything open-ended, please use Discussions.
+  - name: 🔒 Security vulnerability
+    url: https://github.com/HthSolid/claude-dejavu/security/policy
+    about: Please do NOT open a public issue. Email dejavu@hendrikthurau.enterprises.
+  - name: 📜 Commercial licensing
+    url: https://github.com/HthSolid/claude-dejavu/blob/main/COMMERCIAL.md
+    about: For bundling, hosting, or competing-use licensing — contact dejavu@hendrikthurau.enterprises.

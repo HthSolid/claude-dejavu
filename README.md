@@ -402,13 +402,7 @@ I have plenty more projects like this in the drawer. With a little funding, they
 
 claude-dejavu is built by **[HTE Switzerland](https://hendrikthurau.enterprises)**.
 
-We're not an outsourcing shop — we're the engineering team founders call when something has to *actually work*. What that looks like in practice:
-
-- **Founders without a CTO** — we step in as fractional CTO. You don't have to fake-it-till-you-make-it on engineering decisions.
-- **Teams who tried offshoring and got burned** — we provide teams of any size. we run nearshoring out of Tunisia (EU timezone, native French, working English, university-trained). You don't have to trial and error.
-- **Funded startups scaling AI infrastructure** — we ship production end-to-end: Postgres, Docker, cloud, and the AI parts you don't have time to learn.
-- **Mentoring student teams** — we sponsor and coach final-year CS projects. Some of the brightest engineers we hire come from there.
-
+We're not an outsourcing shop — we're the engineering team founders call when something has to *actually work*.
 If you have a startup, no CTO, and a roadmap that needs serious engineering, that's our wheelhouse. Reach out at **info@hendrikthurau.enterprises** or [hendrikthurau.enterprises](https://hendrikthurau.enterprises). The plugin you're reading is what that quality looks like.
 
 ### Want to support the work?

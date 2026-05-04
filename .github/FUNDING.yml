@@ -1,0 +1,6 @@
+# Sponsor links — surfaces a "Sponsor" button next to the repo name.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+github: HthSolid
+custom:
+  - "https://hendrikthurau.enterprises"

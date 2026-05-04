@@ -4,6 +4,32 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.5.0b] — 2026-05-04
+
+Governance release. Pure docs / project-meta — no code changes.
+
+### Added
+
+- `CONTRIBUTING.md` — development setup, PR conventions, lightweight
+  in-project FSL contribution clause.
+- `SECURITY.md` — coordinated-disclosure policy with severity-tiered
+  response targets. Contact: `dejavu@hendrikthurau.enterprises`.
+- `.github/ISSUE_TEMPLATE/bug_report.md` and `feature_request.md` —
+  structured templates surfaced when opening a new issue.
+- `.github/ISSUE_TEMPLATE/config.yml` — disables blank issues;
+  redirects questions to Discussions, security to email, commercial
+  licensing to `COMMERCIAL.md`.
+- `.github/PULL_REQUEST_TEMPLATE.md` — checklist incl. tests,
+  CHANGELOG entry, no telemetry, FSL contribution agreement.
+- `.github/FUNDING.yml` — adds the GitHub Sponsors button.
+
+### Changed
+
+- `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`
+  descriptions re-anchored to lead with the rigorous **89.3%** number
+  (n=400, McNemar p<1e-26) instead of the v0.5.0a-only **99%** number.
+  The 99% appears as a hedged "up to" mention with the n=200 caveat.
+
 ## [0.5.0a] — 2026-05-04
 
 The hallucination-reduction release. The rigorous core claim

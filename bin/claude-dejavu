@@ -1,10 +1,25 @@
 #!/bin/bash
-# claude-dejavu CLI — thin wrapper around code/recall.py + bundled venv
+# claude-dejavu CLI — thin wrapper around code/recall.py + bundled venv (POSIX).
+#
+# install.py also generates a per-install wrapper at ~/.local/bin/claude-dejavu
+# pointing at the user's venv directly. This file is kept for users who run
+# `bin/claude-dejavu` straight out of the plugin clone.
+#
+# Tries python3 first (canonical POSIX name), falls back to python (which the
+# venv module symlinks to on some distros).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_ROOT="${CLAUDE_DEJAVU_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-dejavu}"
 VENV="$DATA_ROOT/venv"
-if [ ! -x "$VENV/bin/python3" ]; then
-  echo "claude-dejavu: venv missing at $VENV — run scripts/install.sh first" >&2
+
+if [ -x "$VENV/bin/python3" ]; then
+  PYBIN="$VENV/bin/python3"
+elif [ -x "$VENV/bin/python" ]; then
+  PYBIN="$VENV/bin/python"
+else
+  echo "claude-dejavu: venv missing at $VENV" >&2
+  echo "  Run: python scripts/install.py --auto" >&2
+  echo "  Or:  python3 scripts/install.py --auto" >&2
   exit 1
 fi
-exec "$VENV/bin/python3" "$SCRIPT_DIR/code/recall.py" "$@"
+
+exec "$PYBIN" "$SCRIPT_DIR/code/recall.py" "$@"

@@ -69,7 +69,21 @@ WEAVIATE_TIMEOUT = 600
 # Local imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    from gist import make_gist
+    # `rule_gist` is the deterministic, no-I/O, no-LLM path. We use it
+    # directly during ingest because the hybrid `make_gist` will reach
+    # out to Ollama on long assistant turns even with prefer_llm=False
+    # (line 148 of gist.py: text>=1000 + assistant + text → use_llm).
+    # That LLM call has a 30s urllib timeout — for a 32 MB session
+    # with thousands of long assistant turns, ingest blocks for tens
+    # of minutes per session waiting on Ollama.
+    #
+    # Ingest needs to be fast and deterministic. If a higher-quality
+    # gist is ever desired, it should be computed on-demand at search
+    # time, not during ingest of historical sessions.
+    from gist import rule_gist as _rule_gist
+
+    def make_gist(text, role=None, content_type=None, prefer_llm=False):
+        return _rule_gist(text), "rule"
 except Exception:
     def make_gist(text, role=None, content_type=None, prefer_llm=False):
         return text[:80], "rule"
@@ -132,9 +146,31 @@ def parse_ts(s):
         return None
 
 
+def _strip_nul(obj):
+    """Recursively strip NUL (0x00) bytes from strings in any nested
+    structure. Postgres TEXT and JSONB both reject NUL bytes; Claude Code
+    .jsonl files can contain them when tool outputs captured binary or
+    truncated terminal data. Without this, a single NUL-containing turn
+    aborts the whole ingest transaction and the cursor never advances —
+    every subsequent SessionEnd hook re-fails at the same byte and the
+    session goes silently un-indexed.
+    """
+    if isinstance(obj, str):
+        return obj.replace("\x00", "") if "\x00" in obj else obj
+    if isinstance(obj, dict):
+        return {k: _strip_nul(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_nul(x) for x in obj]
+    return obj
+
+
 def extract_text_blocks(content) -> list[tuple[str, str]]:
-    """Return list of (content_type, text) pairs from a message.content field."""
-    out = []
+    """Return list of (content_type, text) pairs from a message.content field.
+
+    All returned strings are NUL-sanitized at the boundary so downstream
+    PG inserts cannot crash on `\\x00`.
+    """
+    out: list[tuple[str, str]] = []
     if isinstance(content, str):
         out.append(("text", content))
     elif isinstance(content, list):
@@ -147,13 +183,20 @@ def extract_text_blocks(content) -> list[tuple[str, str]]:
             elif ct == "thinking":
                 out.append(("thinking", c.get("thinking", "")))
             elif ct == "tool_use":
-                out.append(("tool_use", json.dumps({"name": c.get("name"), "input": c.get("input"), "id": c.get("id")})))
+                out.append(("tool_use", json.dumps(
+                    {"name": c.get("name"),
+                     "input": _strip_nul(c.get("input")),
+                     "id": c.get("id")})))
             elif ct == "tool_result":
                 tr = c.get("content", "")
                 if isinstance(tr, list):
-                    tr = "\n".join(x.get("text", "") for x in tr if isinstance(x, dict) and x.get("type") == "text")
+                    tr = "\n".join(
+                        x.get("text", "") for x in tr
+                        if isinstance(x, dict) and x.get("type") == "text"
+                    )
                 out.append(("tool_result", tr if isinstance(tr, str) else json.dumps(tr)))
-    return out
+    # Sanitize every emitted string before it leaves this function.
+    return [(ct, _strip_nul(t) if isinstance(t, str) else t) for ct, t in out]
 
 
 def weaviate_id_for(session_id: str, turn_id: int) -> str:
@@ -195,12 +238,99 @@ def weaviate_batch_upsert(items: list[tuple[int, dict]]) -> dict[int, str]:
     return succeeded
 
 
+def _ingest_lock_path(session_uuid: str) -> Path:
+    """Per-session ingest lock file. Prevents concurrent stop-hooks for the
+    same session from racing on PG (multiple Claude Code windows ending
+    around the same time used to deadlock here).
+
+    Stale locks (older than INGEST_LOCK_TTL_S) are reaped — handles
+    crashed-ingester scenario without manual cleanup."""
+    cfg = _CFG
+    data_root = cfg.get("DATA_ROOT")
+    if not data_root:
+        override = os.environ.get("CLAUDE_DEJAVU_DATA_ROOT")
+        data_root = override or str(Path.home() / ".local" / "share" / "claude-dejavu")
+    locks_dir = Path(data_root) / "locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    return locks_dir / f"ingest-{session_uuid}.lock"
+
+
+INGEST_LOCK_TTL_S = 1800   # 30 min — long enough for a 50 MB session,
+                            # short enough that a hung-and-killed
+                            # ingester clears within 30 min.
+
+
+def _acquire_ingest_lock(session_uuid: str) -> bool:
+    """Best-effort file lock — write our PID into the lockfile.
+    Returns True if we got it."""
+    lock = _ingest_lock_path(session_uuid)
+    try:
+        if lock.exists():
+            age = time.time() - lock.stat().st_mtime
+            if age < INGEST_LOCK_TTL_S:
+                # Another live ingester for this session.
+                return False
+            # Stale — reap.
+            lock.unlink(missing_ok=True)
+        # O_CREAT|O_EXCL is the canonical "atomic create new file" pattern.
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        # If we can't lock for any other reason (perms, FS full), proceed
+        # without lock — better to ingest than to silently skip.
+        return True
+
+
+def _release_ingest_lock(session_uuid: str) -> None:
+    try:
+        _ingest_lock_path(session_uuid).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _progress_emit(session_uuid: str, line_no: int, file_size: int,
+                   bytes_read: int, new_turns: int, started: float) -> None:
+    """Emit a one-line progress heartbeat to stderr. Picked up by stop.py's
+    ingest.log redirect AND by `claude-dejavu reingest --verbose`."""
+    elapsed = time.time() - started
+    pct = (bytes_read / file_size * 100) if file_size > 0 else 0.0
+    rate = (new_turns / elapsed) if elapsed > 0 else 0.0
+    print(f"[ingest] {session_uuid[:8]}  line={line_no}  bytes={bytes_read}/{file_size} ({pct:.1f}%)  "
+          f"+{new_turns}t  {rate:.0f}t/s  {elapsed:.0f}s",
+          file=sys.stderr, flush=True)
+
+
 def ingest_jsonl(jsonl_path: str, session_uuid: str, project_encoded: str | None, conn):
-    """Ingest a single jsonl file. Idempotent via ingest_cursors."""
+    """Ingest a single jsonl file. Idempotent via ingest_cursors. Per-session
+    locked to prevent concurrent stop-hooks from racing on the same session."""
     if not os.path.exists(jsonl_path):
         print(f"  jsonl not found: {jsonl_path}", file=sys.stderr)
         return 0
 
+    if not _acquire_ingest_lock(session_uuid):
+        # Another ingester for this exact session is already running.
+        # Skip cleanly — its progress is what we'd be writing anyway.
+        print(f"[ingest] {session_uuid[:8]} skipped (another ingester holds the lock)",
+              file=sys.stderr)
+        return None
+
+    try:
+        return _ingest_jsonl_locked(jsonl_path, session_uuid, project_encoded, conn)
+    finally:
+        # Always release the lock — even on uncaught exceptions, KeyboardInterrupt,
+        # OOM, etc. The lock TTL is a fallback; this is the primary release.
+        _release_ingest_lock(session_uuid)
+
+
+def _ingest_jsonl_locked(jsonl_path: str, session_uuid: str,
+                          project_encoded: str | None, conn):
+    """Inner ingest body, called only with the per-session lock held.
+    Split out so `ingest_jsonl` can wrap the body in try/finally for
+    guaranteed lock release."""
     file_size = os.path.getsize(jsonl_path)
     file_sha = sha256_file(jsonl_path) if file_size < 200_000_000 else None
 
@@ -255,118 +385,218 @@ def ingest_jsonl(jsonl_path: str, session_uuid: str, project_encoded: str | None
         pending_vec.clear()
 
     try:
-        fh = open(jsonl_path)
+        # Explicit utf-8 + errors='replace' so a stray byte from a
+        # Windows-encoded paste or a truncated terminal capture doesn't
+        # crash the read loop with UnicodeDecodeError.
+        fh = open(jsonl_path, encoding="utf-8", errors="replace")
     except FileNotFoundError:
         # Source jsonl was deleted or moved (common when bootstrapping
         # against an aged ingest_cursors row pointing at a removed
         # project). Skip cleanly — the cursor stays untouched so a
         # later run can pick it up if the file returns.
+        # Lock is released by the outer ingest_jsonl wrapper's finally.
         print(f"[ingest] source missing, skipping: {jsonl_path}",
               file=sys.stderr)
         return None
+
+    # Periodic-commit cadence: how many successful turns between durable
+    # cursor saves. Trades a little throughput for crash-resilience —
+    # if a later turn explodes, we still keep ~N turns of forward
+    # progress instead of redoing everything from `last_line`.
+    COMMIT_EVERY_N_TURNS = 500
+    PROGRESS_EVERY_N_TURNS = 250
+    turns_since_commit = 0
+    turns_since_progress = 0
+    started = time.time()
+    bytes_read = 0
+
+    def _save_cursor_and_commit(at_line: int, at_byte: int) -> None:
+        """Persist progress up to `at_line` (and the actual byte offset
+        within the jsonl file at that line) and commit. Used for
+        periodic durable progress + final-bookkeeping commit at end."""
+        cur.execute("""
+            INSERT INTO ingest_cursors (session_id, last_line, last_byte, last_run_at)
+            VALUES (%s, %s, %s, now())
+            ON CONFLICT (session_id) DO UPDATE
+              SET last_line  = EXCLUDED.last_line,
+                  last_byte  = EXCLUDED.last_byte,
+                  last_run_at = now()
+        """, (session_uuid, at_line, at_byte))
+        conn.commit()
+
+    skipped_lines = 0
+    failed_lines = 0
     with fh:
         for line in fh:
             line_no += 1
+            # Track actual byte offset by accumulating per-line length.
+            # We can't use `fh.tell()` here because Python's text-mode
+            # file iterator uses an internal readahead buffer that
+            # disables tell() (raises "telling position disabled by
+            # next() call"). Encoding each line back to bytes is
+            # ~free (microseconds) and gives us an accurate offset.
+            bytes_read += len(line.encode("utf-8", errors="replace"))
             if line_no <= last_line:
                 continue
+            # ── per-line try/except ──────────────────────────────────
+            # Wrap each line so one bad turn cannot abort the whole
+            # session ingest. Without this, a single PG-rejected row
+            # leaves the transaction in an aborted state and every
+            # subsequent statement fails with InFailedSqlTransaction
+            # — which is exactly what made dejavu lose entire
+            # sessions before this fix landed.
             try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-
-            # Capture aiTitle
-            if obj.get("type") == "ai-title":
-                ai_title = obj.get("aiTitle")
-                continue
-
-            # Skip non-message types we don't track as turns
-            if obj.get("type") not in ("user", "assistant"):
-                continue
-
-            ts = parse_ts(obj.get("timestamp"))
-            if ts and not started_at:
-                started_at = ts
-            if ts:
-                last_ts = ts
-
-            msg = obj.get("message", {}) or {}
-            role = obj.get("type") if obj.get("type") in ("user", "assistant") else msg.get("role")
-            model = msg.get("model") if obj.get("type") == "assistant" else None
-            usage = msg.get("usage") or {}
-            tokens_in = usage.get("input_tokens")
-            tokens_out = usage.get("output_tokens")
-
-            content = msg.get("content")
-            blocks = extract_text_blocks(content)
-
-            for content_type, text in blocks:
-                if not text:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    skipped_lines += 1
                     continue
-                # For tool_result blocks, attribute back to the previous tool_use turn
-                # but still create a turn row for the relationship.
-                # Compute gist for user/asst text (cheapest case in the hot path)
-                gist_val, gist_method = (None, None)
-                if role in ("user", "assistant") and content_type == "text" and len(text) >= 30:
-                    gist_val, gist_method = make_gist(text, role=role, content_type=content_type, prefer_llm=False)
 
-                cur.execute("""
-                    INSERT INTO turns (session_id, idx, parent_uuid, message_uuid, role, ts, content, content_type, tokens_in, tokens_out, model, gist, gist_method)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (session_id, idx) DO NOTHING
-                    RETURNING id
-                """, (session_uuid, line_no * 10 + len(text) % 9,
-                      obj.get("parentUuid"), obj.get("uuid"),
-                      role, ts, text, content_type, tokens_in, tokens_out, model,
-                      gist_val, gist_method))
-                row = cur.fetchone()
-                if row is None:
+                # Capture aiTitle
+                if obj.get("type") == "ai-title":
+                    ai_title = _strip_nul(obj.get("aiTitle"))
                     continue
-                turn_id = row[0]
-                new_turns += 1
 
-                # Tool calls + file touches
-                if content_type == "tool_use":
-                    try:
-                        d = json.loads(text)
-                    except Exception:
-                        d = {}
-                    tool_name = d.get("name", "")
-                    tool_input = d.get("input") or {}
+                # Skip non-message types we don't track as turns
+                if obj.get("type") not in ("user", "assistant"):
+                    continue
+
+                ts = parse_ts(obj.get("timestamp"))
+                if ts and not started_at:
+                    started_at = ts
+                if ts:
+                    last_ts = ts
+
+                msg = obj.get("message", {}) or {}
+                role = obj.get("type") if obj.get("type") in ("user", "assistant") else msg.get("role")
+                model = msg.get("model") if obj.get("type") == "assistant" else None
+                usage = msg.get("usage") or {}
+                tokens_in = usage.get("input_tokens")
+                tokens_out = usage.get("output_tokens")
+
+                content = msg.get("content")
+                blocks = extract_text_blocks(content)
+
+                for content_type, text in blocks:
+                    if not text:
+                        continue
+                    # Defense-in-depth: the source `extract_text_blocks`
+                    # already strips NULs, but belt-and-suspenders here
+                    # in case a custom call site bypassed it.
+                    text = _strip_nul(text)
+                    # Compute gist for user/asst text (cheapest case in the hot path)
+                    gist_val, gist_method = (None, None)
+                    if role in ("user", "assistant") and content_type == "text" and len(text) >= 30:
+                        gist_val, gist_method = make_gist(text, role=role, content_type=content_type, prefer_llm=False)
+                        gist_val = _strip_nul(gist_val)
+
                     cur.execute("""
-                        INSERT INTO tool_calls (turn_id, session_id, tool_use_id, tool_name, tool_input, ts)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO turns (session_id, idx, parent_uuid, message_uuid, role, ts, content, content_type, tokens_in, tokens_out, model, gist, gist_method)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (session_id, idx) DO NOTHING
                         RETURNING id
-                    """, (turn_id, session_uuid, d.get("id"), tool_name, psycopg2.extras.Json(tool_input), ts))
-                    tc_id = cur.fetchone()[0]
-                    # File touches
-                    if tool_name in ("Write", "Edit", "MultiEdit") and isinstance(tool_input, dict):
-                        fp = tool_input.get("file_path")
-                        if fp:
-                            op = {"Write": "write", "Edit": "edit", "MultiEdit": "multi_edit"}[tool_name]
-                            cur.execute("""
-                                INSERT INTO file_touches (tool_call_id, session_id, file_path, op, ts)
-                                VALUES (%s, %s, %s, %s, %s)
-                            """, (tc_id, session_uuid, fp, op, ts))
+                    """, (session_uuid, line_no * 10 + len(text) % 9,
+                          obj.get("parentUuid"), obj.get("uuid"),
+                          role, ts, text, content_type, tokens_in, tokens_out, model,
+                          gist_val, gist_method))
+                    row = cur.fetchone()
+                    if row is None:
+                        continue
+                    turn_id = row[0]
+                    new_turns += 1
+                    turns_since_commit += 1
 
-                # Vectorize ONLY user/assistant text (skip tool_use/tool_result/thinking)
-                # AND skip trivially short messages.
-                if role in ("user", "assistant") and content_type == "text" and len(text) >= CONTENT_VECTORIZE_MIN:
-                    snippet = text[:CONTENT_VECTORIZE_MAX]
-                    pending_vec.append((turn_id, {
-                        "session_id": session_uuid,
-                        "turn_id": turn_id,
-                        "project_slug": slug,
-                        "role": role,
-                        "content": snippet,
-                        "ts": ts.isoformat() if ts else None,
-                        "model": model or "",
-                        "ai_title": ai_title or "",
-                    }))
-                    if len(pending_vec) >= WEAVIATE_BATCH_SIZE:
-                        flush_vectors()
+                    # Tool calls + file touches
+                    if content_type == "tool_use":
+                        try:
+                            d = json.loads(text)
+                        except Exception:
+                            d = {}
+                        tool_name = _strip_nul(d.get("name", "")) or ""
+                        tool_input = _strip_nul(d.get("input") or {})
+                        cur.execute("""
+                            INSERT INTO tool_calls (turn_id, session_id, tool_use_id, tool_name, tool_input, ts)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                        """, (turn_id, session_uuid, d.get("id"), tool_name, psycopg2.extras.Json(tool_input), ts))
+                        tc_id = cur.fetchone()[0]
+                        # File touches
+                        if tool_name in ("Write", "Edit", "MultiEdit") and isinstance(tool_input, dict):
+                            fp = _strip_nul(tool_input.get("file_path"))
+                            if fp:
+                                op = {"Write": "write", "Edit": "edit", "MultiEdit": "multi_edit"}[tool_name]
+                                cur.execute("""
+                                    INSERT INTO file_touches (tool_call_id, session_id, file_path, op, ts)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (tc_id, session_uuid, fp, op, ts))
+
+                    # Vectorize ONLY user/assistant text (skip tool_use/tool_result/thinking)
+                    # AND skip trivially short messages.
+                    if role in ("user", "assistant") and content_type == "text" and len(text) >= CONTENT_VECTORIZE_MIN:
+                        snippet = text[:CONTENT_VECTORIZE_MAX]
+                        pending_vec.append((turn_id, {
+                            "session_id": session_uuid,
+                            "turn_id": turn_id,
+                            "project_slug": slug,
+                            "role": role,
+                            "content": snippet,
+                            "ts": ts.isoformat() if ts else None,
+                            "model": model or "",
+                            "ai_title": ai_title or "",
+                        }))
+                        if len(pending_vec) >= WEAVIATE_BATCH_SIZE:
+                            flush_vectors()
+
+                # Periodic progress heartbeat — visible in `claude-dejavu
+                # reingest` interactive runs and in stop.py's ingest.log.
+                # Lets the user see "is it making progress" without
+                # opening pg_stat_activity.
+                turns_since_progress += 1
+                if turns_since_progress >= PROGRESS_EVERY_N_TURNS:
+                    _progress_emit(session_uuid, line_no, file_size,
+                                   bytes_read, new_turns, started)
+                    turns_since_progress = 0
+
+                # Periodic durable progress: every COMMIT_EVERY_N_TURNS
+                # successful turns, flush pending vectors, persist the
+                # cursor up to the current line, and commit. If a later
+                # line crashes the loop, we keep at least N-N_TURNS
+                # turns of forward progress instead of having to redo
+                # the entire session from scratch on next run.
+                if turns_since_commit >= COMMIT_EVERY_N_TURNS:
+                    flush_vectors()
+                    _save_cursor_and_commit(line_no, bytes_read)
+                    turns_since_commit = 0
+
+            except Exception as e:
+                # One bad line should not break the rest of the
+                # session. Roll back the aborted transaction (psycopg2
+                # leaves it in InFailedSqlTransaction state otherwise),
+                # log a single line of context, and march on.
+                conn.rollback()
+                failed_lines += 1
+                snippet = (line[:120] if isinstance(line, str) else str(line)[:120]).replace("\n", " ")
+                print(f"[ingest] line {line_no} skipped ({type(e).__name__}: {e}) — {snippet!r}",
+                      file=sys.stderr)
+                # Move the cursor past this line so we don't retry it
+                # next run. Save in its own tx since previous one was
+                # rolled back.
+                try:
+                    _save_cursor_and_commit(line_no, bytes_read)
+                except Exception:
+                    conn.rollback()
 
     # Flush any remaining vectorization pending
     flush_vectors()
+    if skipped_lines or failed_lines:
+        print(f"[ingest] {jsonl_path}: skipped_json={skipped_lines}  failed_inserts={failed_lines}",
+              file=sys.stderr)
+    # Final completion heartbeat (always, regardless of N-turn cadence,
+    # so even tiny sessions log a result line).
+    elapsed = time.time() - started
+    print(f"[ingest] {session_uuid[:8]} done  +{new_turns} turns  +{new_vectors} vectors  "
+          f"line={line_no}  bytes={bytes_read}/{file_size}  in {elapsed:.1f}s",
+          file=sys.stderr, flush=True)
 
     # Update session aggregates
     cur.execute("""
@@ -378,7 +608,8 @@ def ingest_jsonl(jsonl_path: str, session_uuid: str, project_encoded: str | None
         WHERE id = %s
     """, (ai_title, started_at, last_ts, session_uuid, session_uuid))
 
-    # Save cursor
+    # Save cursor — at end-of-file, last_byte is the actual file size
+    # because we read to EOF.
     cur.execute("""
         INSERT INTO ingest_cursors (session_id, last_line, last_byte, last_run_at)
         VALUES (%s, %s, %s, now())
@@ -386,6 +617,7 @@ def ingest_jsonl(jsonl_path: str, session_uuid: str, project_encoded: str | None
     """, (session_uuid, line_no, file_size))
 
     conn.commit()
+    # Lock release handled by outer ingest_jsonl finally.
     return new_turns, new_vectors, line_no
 
 
@@ -495,6 +727,164 @@ def cmd_stop_hook(conn):
         print(f"[stop-hook] +{res[0]} turns, +{res[1]} vectors")
 
 
+def _ingest_one_with_own_conn(jsonl_path: str, session_uuid: str,
+                                proj_enc: str) -> tuple[str, tuple | None, str | None]:
+    """Worker fn for parallel reingest. Opens its own PG connection so
+    multiple workers can run concurrently. Returns
+    (session_uuid, ingest_result_or_None, error_str_or_None)."""
+    try:
+        worker_conn = psycopg2.connect(PG_DSN)
+    except Exception as e:
+        return (session_uuid, None, f"connect-failed: {type(e).__name__}: {e}")
+    try:
+        res = ingest_jsonl(jsonl_path, session_uuid, proj_enc, worker_conn)
+        return (session_uuid, res, None)
+    except Exception as e:
+        try:
+            worker_conn.rollback()
+        except Exception:
+            pass
+        return (session_uuid, None, f"{type(e).__name__}: {e}")
+    finally:
+        try:
+            worker_conn.close()
+        except Exception:
+            pass
+
+
+def _find_missing_sessions(conn) -> list[tuple[str, str, str, int]]:
+    """Walk ~/.claude/projects/ and return (sid, proj_enc, jsonl_path, size_bytes)
+    for every session whose jsonl exists on disk but has zero indexed
+    turns OR no ingest_cursors row. Used by --missing-only."""
+    live_root = Path.home() / ".claude" / "projects"
+    if not live_root.is_dir():
+        return []
+    cur = conn.cursor()
+    out: list[tuple[str, str, str, int]] = []
+    for proj in sorted(live_root.iterdir()):
+        if not proj.is_dir():
+            continue
+        for f in sorted(proj.iterdir()):
+            if not f.name.endswith(".jsonl"):
+                continue
+            sid = f.name[:-len(".jsonl")]
+            cur.execute(
+                "SELECT (SELECT count(*) FROM turns WHERE session_id = %s::uuid), "
+                "       (SELECT count(*) FROM ingest_cursors WHERE session_id = %s::uuid)",
+                (sid, sid))
+            turn_count, cursor_count = cur.fetchone()
+            if turn_count == 0 or cursor_count == 0:
+                try:
+                    size = f.stat().st_size
+                except OSError:
+                    size = 0
+                out.append((sid, proj.name, str(f), size))
+    return out
+
+
+def cmd_reingest(conn, session_id=None, missing_only=False, workers: int = 1):
+    """Force re-ingest of session(s) — recovery action for ingest gaps.
+
+    Modes:
+      - session_id: clear that one session's cursor and re-ingest it.
+        Use when a single session is known-bad.
+      - missing_only=True: re-ingest only sessions whose .jsonl exists
+        on disk but is NOT represented in the `turns` table (the gap
+        case — sessions whose ingest crashed before the cursor was
+        ever written).
+      - default: clear ALL cursors and re-run bootstrap (full re-scan).
+        Use after fixing an ingest bug to backfill historical sessions
+        that were partially or never indexed.
+
+    workers > 1: process sessions in parallel using thread workers, each
+    with its own PG connection. Useful for --missing-only / default
+    paths where 10+ sessions are independent (each session has its
+    own row lock and Weaviate UUID space, so concurrency is safe).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    cur = conn.cursor()
+
+    if session_id:
+        # Single-session targeted re-ingest.
+        cur.execute("DELETE FROM ingest_cursors WHERE session_id = %s", (session_id,))
+        conn.commit()
+        live_root = Path.home() / ".claude" / "projects"
+        for proj in live_root.iterdir() if live_root.is_dir() else []:
+            jsonl = proj / f"{session_id}.jsonl"
+            if jsonl.exists():
+                proj_enc = proj.name
+                print(f"[reingest] {proj_enc}/{session_id}  size={jsonl.stat().st_size/1e6:.1f}MB")
+                res = ingest_jsonl(str(jsonl), session_id, proj_enc, conn)
+                if res:
+                    print(f"  -> +{res[0]} turns, +{res[1]} vectors, lines={res[2]}")
+                return
+        print(f"[reingest] session {session_id} not found in ~/.claude/projects/",
+              file=sys.stderr)
+        return
+
+    if missing_only:
+        sessions = _find_missing_sessions(conn)
+        if not sessions:
+            print("[reingest] no missing sessions — index is in sync with disk.")
+            return
+
+        total_size_mb = sum(s[3] for s in sessions) / 1e6
+        print(f"[reingest] {len(sessions)} session(s) missing from index "
+              f"({total_size_mb:.1f}MB total). workers={workers}")
+
+        # Clear cursors for all in one shot (cheaper than per-worker DELETEs).
+        for sid, _, _, _ in sessions:
+            cur.execute("DELETE FROM ingest_cursors WHERE session_id = %s::uuid", (sid,))
+        conn.commit()
+
+        n_done = n_turn = 0
+        errors: list[tuple[str, str]] = []
+
+        if workers <= 1:
+            # Sequential path — keep original simple flow.
+            for sid, proj_enc, jsonl, size in sessions:
+                print(f"[reingest] missing: {proj_enc}/{sid[:8]}  size={size/1e6:.1f}MB")
+                _, res, err = _ingest_one_with_own_conn(jsonl, sid, proj_enc)
+                if err:
+                    errors.append((sid, err))
+                if res:
+                    n_done += 1
+                    n_turn += res[0]
+                    print(f"  -> +{res[0]} turns, +{res[1]} vectors")
+        else:
+            # Parallel path — N workers, each with own conn.
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                fut_to_sid = {
+                    ex.submit(_ingest_one_with_own_conn, jsonl, sid, proj_enc): sid
+                    for sid, proj_enc, jsonl, _ in sessions
+                }
+                for fut in as_completed(fut_to_sid):
+                    sid, res, err = fut.result()
+                    if err:
+                        errors.append((sid, err))
+                        print(f"[reingest] {sid[:8]} FAILED: {err}", file=sys.stderr)
+                    if res:
+                        n_done += 1
+                        n_turn += res[0]
+                        print(f"[reingest] {sid[:8]} done  +{res[0]} turns  +{res[1]} vectors")
+
+        print(f"\n[reingest] missing-only complete: {n_done}/{len(sessions)} session(s), "
+              f"{n_turn} turn(s)")
+        if errors:
+            print(f"[reingest] {len(errors)} session(s) failed:", file=sys.stderr)
+            for sid, err in errors:
+                print(f"  - {sid[:8]}: {err}", file=sys.stderr)
+        return
+
+    # Default: full re-scan. Clear all cursors, then bootstrap from
+    # live tree. The bootstrap already mirrors + ingests every jsonl.
+    cur.execute("DELETE FROM ingest_cursors")
+    conn.commit()
+    print("[reingest] cleared all cursors; running full bootstrap")
+    cmd_bootstrap_from_live(conn)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--backfill", action="store_true",
@@ -504,14 +894,38 @@ if __name__ == "__main__":
                         "mirror + ingest each one. Used by install.py to import "
                         "pre-existing sessions on first install.")
     p.add_argument("--stop-hook", action="store_true")
+    p.add_argument("--reingest", action="store_true",
+                   help="Force re-scan of sessions. Default: clear ALL cursors "
+                        "and re-bootstrap from live tree (recovery after ingest "
+                        "bug). With --session: re-ingest one session. With "
+                        "--missing-only: re-ingest only sessions whose .jsonl "
+                        "exists but is not represented in the index (gap "
+                        "recovery without disturbing complete sessions).")
+    p.add_argument("--missing-only", action="store_true",
+                   help="Used with --reingest: only re-ingest sessions whose "
+                        ".jsonl is on disk but absent from the index.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Number of parallel ingest workers (each gets its own "
+                        "PG connection). Useful with --reingest --missing-only "
+                        "for fast recovery across many sessions. Default 1.")
     p.add_argument("--session")
     p.add_argument("--jsonl")
     p.add_argument("--project")
     args = p.parse_args()
 
-    conn = psycopg2.connect(PG_DSN)
+    # Top-level try/except — if anything below leaks an uncaught
+    # exception, log it to error_log so doctor can surface it. Without
+    # this, stop-hook ingest crashes go to ingest.log only and never
+    # reach the user. Best-effort — never block return on logging.
+    conn = None
     try:
-        if args.backfill:
+        conn = psycopg2.connect(PG_DSN)
+        if args.reingest:
+            cmd_reingest(conn,
+                         session_id=args.session,
+                         missing_only=args.missing_only,
+                         workers=max(1, args.workers))
+        elif args.backfill:
             cmd_backfill(conn)
         elif args.bootstrap:
             cmd_bootstrap_from_live(conn)
@@ -522,5 +936,34 @@ if __name__ == "__main__":
             print(f"Ingested: {res}")
         else:
             p.print_help()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\n[ingester] interrupted by user", file=sys.stderr)
+        raise
+    except Exception as e:
+        # Surface to error_log so dejavu doctor's error_log check
+        # picks it up. Stop hook's silent-failure root cause closed.
+        try:
+            from error_log import log_error
+            mode = (
+                "reingest" if args.reingest else
+                "backfill" if args.backfill else
+                "bootstrap" if args.bootstrap else
+                "stop-hook" if args.stop_hook else "single-session"
+            )
+            log_error(
+                f"ingester.{mode}",
+                f"top-level uncaught: {type(e).__name__}: {e}",
+                exc_info=True,
+                context={"session": args.session, "jsonl": args.jsonl},
+            )
+        except Exception:
+            pass
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass

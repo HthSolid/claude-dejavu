@@ -7,6 +7,16 @@
 #   transformers: 9998 (internal use)
 #
 # Override host ports via .env: PG_PORT=5460 docker compose up -d
+#
+# CRITICAL — explicit project name. Without `name:` Compose derives
+# the project name from the parent directory (here: `docker/`).
+# Many other open-source projects also use a `docker/` subdirectory,
+# so two stacks would silently share the same project namespace and
+# Compose would treat the OTHER stack's containers as orphans and
+# remove them on `up -d`. Pinning the project name to
+# `claude-dejavu` keeps our containers cleanly isolated.
+name: claude-dejavu
+
 services:
 
   postgres:

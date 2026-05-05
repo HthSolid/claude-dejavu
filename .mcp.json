@@ -2,7 +2,7 @@
   "mcpServers": {
     "claude-dejavu": {
       "type": "stdio",
-      "command": "python3",
+      "command": "python",
       "args": [
         "${CLAUDE_PLUGIN_ROOT}/bin/claude-dejavu-mcp.py"
       ]

@@ -4,6 +4,31 @@ If you've installed Claude Code, you're 90 % of the way there. This guide walks
 you through the rest assuming **zero prior knowledge** of Docker, PostgreSQL,
 or Weaviate.
 
+> ## ⚠️ Note for Windows users
+>
+> Versions **v0.5.0c and earlier** had a hook-dispatch bug that broke
+> the marketplace install on Windows native (symptom:
+> `MCP error -32000: Connection closed`). Fixed in **v0.5.0d**.
+>
+> If you previously installed an older version and the plugin appeared
+> "enabled" but did nothing, refresh the marketplace clone and re-run
+> the installer manually:
+>
+> ```powershell
+> cd "$env:APPDATA\claude\plugins\marketplaces\claude-dejavu"
+> git fetch origin main
+> git reset --hard origin/main
+> python "$env:APPDATA\claude\plugins\marketplaces\claude-dejavu\scripts\install.py"
+> ```
+>
+> Then fully restart Claude Code. Fresh installs of v0.5.0d+ don't
+> need this — the Setup hook fires correctly.
+>
+> If you still hit issues after upgrading: tracking
+> [issue #2](https://github.com/HthSolid/claude-dejavu/issues/2) — please
+> add `claude-dejavu doctor` output + `winver` to a comment so we can
+> rule out remaining edge cases.
+
 > **Recommended path: install via the Claude Code marketplace.** It's a
 > two-line install with everything else automatic.
 >

@@ -22,6 +22,18 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+# Windows defaults stdout to cp1252 which can't encode the ✓/⚠/✗
+# characters we use in the report. Reconfigure to UTF-8 on import so
+# `python doctor.py` from cmd.exe / PowerShell doesn't crash with
+# UnicodeEncodeError. `errors="replace"` is the belt-and-suspenders:
+# anything truly unencodable becomes `?` instead of an exception.
+if sys.platform.startswith("win") and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
 
 @dataclass
 class CheckResult:
@@ -208,6 +220,51 @@ def _check_postgres(cfg: dict, rep: Report) -> bool:
         ))
         return True
     n = int((r.stdout or "0").strip() or 0)
+
+    # Table-by-table integrity check — sourced from schema.sql so
+    # every CREATE TABLE IF NOT EXISTS is verified. Catches the
+    # silent-data-loss mode where Postgres is up but our tables are
+    # gone (orphan-container destruction, fresh container against a
+    # stale config.env, manual `docker compose down -v`, etc.).
+    try:
+        from health import expected_pg_tables
+        expected = expected_pg_tables()
+    except Exception:  # noqa: BLE001
+        expected = set()
+    if expected:
+        # Get the actual set of public tables
+        r2 = subprocess.run(
+            [psql, "-h", host, "-p", str(port), "-U", user, "-d", db,
+              "-tA", "-c",
+              "SELECT table_name FROM information_schema.tables "
+              "WHERE table_schema='public'"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        if r2.returncode == 0:
+            actual = {ln.strip() for ln in (r2.stdout or "").splitlines()
+                          if ln.strip()}
+            missing = sorted(expected - actual)
+            if missing:
+                shown = ", ".join(missing[:5])
+                if len(missing) > 5:
+                    shown += f", … (+{len(missing) - 5} more)"
+                rep.add(CheckResult(
+                    "postgres_schema", "fail",
+                    detail=(f"{len(missing)}/{len(expected)} expected "
+                              f"tables missing in {db}: {shown}"),
+                    fix=(f"Re-apply schema:  psql -h {host} -p {port} "
+                           f"-U {user} -d {db} -f code/schema.sql\n"
+                           f"Or restart Claude Code — SessionStart "
+                           f"will auto-repair on next launch."),
+                ))
+                return True
+            rep.add(CheckResult(
+                "postgres", "ok",
+                detail=f"{host}:{port} db={db} ({n} tables, "
+                          f"all {len(expected)} expected present)"))
+            return True
+    # Fallback when we can't load the expected list — fall back to
+    # the original count-based check.
     if n < 6:
         rep.add(CheckResult(
             "postgres_schema", "fail",
@@ -229,17 +286,52 @@ def _check_weaviate(cfg: dict, rep: Report) -> bool:
         with urllib.request.urlopen(f"{url}/v1/meta", timeout=3) as r:
             data = json.loads(r.read())
         ver = data.get("version", "?")
-        rep.add(CheckResult("weaviate", "ok",
-                            detail=f"v{ver} at {url}, modules={list(data.get('modules', {}))}"))
-        return True
     except Exception as e:
         rep.add(CheckResult(
             "weaviate", "fail",
             detail=f"{url} not responding: {type(e).__name__}: {e}",
             fix=("Start the bundled stack:\n"
-                 f"  docker compose -f {_plugin_root()}/docker/docker-compose.minimal.yml up -d"),
+                 f"  docker compose -p claude-dejavu -f {_plugin_root()}/docker/docker-compose.minimal.yml up -d"),
         ))
         return False
+
+    # Weaviate is up — now verify our class is registered. This
+    # closes the silent-failure mode where the user destroyed +
+    # recreated their Weaviate container, ending up with a working
+    # Weaviate but no `ClaudeDejavuTurn` class. Searches would
+    # silently return zero hits forever.
+    try:
+        from health import (check_weaviate_class,
+                                expected_weaviate_class)
+        cname = expected_weaviate_class()
+        wv_status = check_weaviate_class(url, cname)
+    except Exception as e:  # noqa: BLE001
+        wv_status = {"ok": False, "exists": False,
+                       "error": f"{type(e).__name__}: {e}"}
+    if not wv_status.get("ok"):
+        if not wv_status.get("exists"):
+            rep.add(CheckResult(
+                "weaviate", "fail",
+                detail=(f"v{ver} at {url}, but class "
+                          f"`{cname}` is missing"),
+                fix=("Restart Claude Code — SessionStart will "
+                       "auto-repair the class. Or manually:\n"
+                       f"  python {_plugin_root()}/scripts/install.py "
+                       f"--auto"),
+            ))
+        else:
+            rep.add(CheckResult(
+                "weaviate", "warn",
+                detail=(f"v{ver} at {url}, class check error: "
+                          f"{wv_status.get('error')}"),
+            ))
+        return True
+
+    rep.add(CheckResult("weaviate", "ok",
+                          detail=(f"v{ver} at {url}, modules="
+                                    f"{list(data.get('modules', {}))}, "
+                                    f"class `{cname}` ok")))
+    return True
 
 
 def _check_symbol_index(cfg: dict, rep: Report) -> None:
@@ -278,6 +370,58 @@ def _check_symbol_index(cfg: dict, rep: Report) -> None:
     else:
         rep.add(CheckResult("symbol_index", "ok",
                             detail=f"{syms} symbols across {projects} project(s)"))
+
+
+def _check_perf_class(cfg: dict, rep: Report) -> None:
+    """Surface the machine's local-LLM performance classification.
+
+    Set by `claude-dejavu bench`. Used by `code/summarize.py` to decide
+    whether to put cloud providers first in the cascade. Doctor surfaces
+    this so users on slow hardware know why their session-end summaries
+    are slow + that the Pro tier solves it.
+
+    Status semantics:
+      - ok    : perf_class=fast (machine handles local Ollama gist
+                under threshold)
+      - skip  : perf_class=untested (bench has never been run; not a
+                problem, just informational)
+      - warn  : perf_class=slow (machine struggles; nudge user toward
+                Pro tier or cloud API key)
+    """
+    perf = (cfg.get("PERF_CLASS") or "").strip().lower()
+    benched_at = cfg.get("PERF_BENCHED_AT", "")
+
+    if not perf or perf == "untested":
+        rep.add(CheckResult(
+            "perf_class", "skip",
+            detail="not yet benchmarked — run `claude-dejavu bench --apply`",
+        ))
+        return
+
+    if perf == "fast":
+        rep.add(CheckResult(
+            "perf_class", "ok",
+            detail=f"local LLM is fast on this machine"
+                   f"{f' (benched {benched_at})' if benched_at else ''}",
+        ))
+        return
+
+    # perf == "slow"
+    rep.add(CheckResult(
+        "perf_class", "warn",
+        detail=(
+            f"local Ollama is slow on this machine"
+            f"{f' (benched {benched_at})' if benched_at else ''}; "
+            "session-end summaries fall back to cloud (if API key set) "
+            "or rule-based digest"
+        ),
+        fix=(
+            "Add a cloud API key (ANTHROPIC_API_KEY / GEMINI_API_KEY / "
+            "OPENROUTER_API_KEY) for fast summaries, OR upgrade to "
+            "claude-dejavu Pro (managed cloud gists, sub-100ms, "
+            "no key setup required) when v0.6 ships."
+        ),
+    ))
 
 
 def _check_error_log(rep: Report) -> None:
@@ -334,6 +478,106 @@ def _check_error_log(rep: Report) -> None:
     rep.add(CheckResult("error_log", status, detail=detail, fix=fix))
 
 
+def _check_ingest_coverage(cfg: dict, rep: Report) -> None:
+    """Detect ingest coverage gaps: jsonl files on disk that don't have a
+    matching cursor in the index.
+
+    Why this matters: silent ingest failures (NUL-byte rows, transaction
+    aborts, encoding errors) used to leave entire sessions un-indexed
+    while the system still reported 'OK' — fatal for a memory plugin.
+    This check makes those gaps loud.
+
+    'fix' field tells the user the exact recovery command. Doctor stays
+    'warn' rather than 'fail' so the rest of the system still reports
+    health, but the gap is visible.
+    """
+    live_root = Path.home() / ".claude" / "projects"
+    if not live_root.is_dir():
+        rep.add(CheckResult("ingest_coverage", "skip",
+                            detail="no ~/.claude/projects/ directory"))
+        return
+
+    # Walk live tree, collect every jsonl session id.
+    on_disk: list[tuple[str, str, int]] = []  # (session_id, project, size_bytes)
+    for proj in sorted(live_root.iterdir()):
+        if not proj.is_dir():
+            continue
+        for f in sorted(proj.iterdir()):
+            if not f.name.endswith(".jsonl"):
+                continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            sid = f.name[:-len(".jsonl")]
+            on_disk.append((sid, proj.name, size))
+
+    if not on_disk:
+        rep.add(CheckResult("ingest_coverage", "ok",
+                            detail="no jsonl files on disk to ingest"))
+        return
+
+    try:
+        import psycopg2  # noqa
+    except Exception:
+        rep.add(CheckResult("ingest_coverage", "skip",
+                            detail="psycopg2 unavailable in this interpreter"))
+        return
+
+    try:
+        conn = psycopg2.connect(
+            host=cfg.get("PG_HOST", "localhost"),
+            port=cfg.get("PG_PORT", "5432"),
+            user=cfg.get("PG_USER", "postgres"),
+            password=cfg.get("PG_PASS", "postgres"),
+            dbname=cfg.get("PG_DB") or "postgres",
+            connect_timeout=2,
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT session_id::text, last_byte FROM ingest_cursors")
+            cursors = {row[0]: row[1] or 0 for row in cur.fetchall()}
+        conn.close()
+    except Exception as e:
+        rep.add(CheckResult("ingest_coverage", "warn",
+                            detail=f"couldn't query ingest_cursors: {e}"))
+        return
+
+    missing: list[str] = []   # never ingested at all
+    stale: list[str] = []     # ingested but cursor lags > 100KB behind file size
+    STALE_BYTES = 102_400     # 100 KB drift threshold
+    for sid, proj, size in on_disk:
+        last_byte = cursors.get(sid)
+        if last_byte is None:
+            missing.append(sid)
+        elif size - last_byte > STALE_BYTES:
+            stale.append(f"{sid[:8]}({(size - last_byte) / 1024:.0f}KB behind)")
+
+    n_total = len(on_disk)
+    n_indexed = n_total - len(missing)
+    summary_parts = [f"{n_indexed}/{n_total} sessions indexed"]
+    if missing:
+        summary_parts.append(f"{len(missing)} never ingested")
+    if stale:
+        summary_parts.append(f"{len(stale)} stale")
+    detail = " · ".join(summary_parts)
+
+    if not missing and not stale:
+        rep.add(CheckResult("ingest_coverage", "ok", detail=detail))
+        return
+
+    fix_parts = []
+    if missing:
+        fix_parts.append("claude-dejavu reingest --missing-only")
+    if stale and not missing:
+        fix_parts.append("claude-dejavu reingest --session <SID>  (or full: --reingest)")
+    rep.add(CheckResult(
+        "ingest_coverage", "warn",
+        detail=detail,
+        fix="  ".join(fix_parts),
+    ))
+
+
 def _check_hooks_wiring(rep: Report) -> None:
     h = _plugin_root() / "hooks" / "hooks.json"
     if not h.exists():
@@ -374,6 +618,8 @@ def run_doctor(verbose: bool = False) -> Report:
     _check_postgres(cfg, rep)
     _check_weaviate(cfg, rep)
     _check_symbol_index(cfg, rep)
+    _check_ingest_coverage(cfg, rep)
+    _check_perf_class(cfg, rep)
     _check_hooks_wiring(rep)
     _check_error_log(rep)
     return rep

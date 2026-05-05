@@ -20,6 +20,13 @@ SUITES = [
     ("runtime_trap", "test_runtime_trap.py"),
     ("scraper", "test_scraper.py"),
     ("v05 followups (integration)", "test_v05_followups.py"),
+    ("ingester robustness (NUL bytes / encoding / boundary)",
+     "test_ingester_robustness.py"),
+    ("install.py helpers (v0.5.0e — docker compose project name, "
+       "INSTALL_STATUS, venv resolver, schema migrations)",
+     "test_install.py"),
+    ("health (storage integrity + auto-repair)",
+     "test_health.py"),
 ]
 
 

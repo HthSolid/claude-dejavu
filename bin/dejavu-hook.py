@@ -70,6 +70,55 @@ def _resolve_target(hook_name: str) -> Path:
     return _plugin_root().joinpath(*parts)
 
 
+def _data_root() -> Path:
+    """Mirrors scripts/install.py's data_root() resolution."""
+    override = os.environ.get("CLAUDE_DEJAVU_DATA_ROOT")
+    if override:
+        return Path(override)
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "claude-dejavu"
+    if sys.platform.startswith("win"):
+        base = (os.environ.get("LOCALAPPDATA")
+                  or os.environ.get("APPDATA")
+                  or str(Path.home() / "AppData" / "Local"))
+        return Path(base) / "claude-dejavu"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    return (Path(xdg) / "claude-dejavu" if xdg
+              else Path.home() / ".local" / "share" / "claude-dejavu")
+
+
+def _resolve_python_for(hook: str) -> str:
+    """Pick the right Python interpreter for `hook`.
+
+    Setup runs install.py which creates the venv — must use
+    sys.executable (the system python that invoked us). All other
+    hooks need psycopg2 / mcp / tree-sitter, which only live in the
+    bundled venv. We MUST re-launch them through the venv python or
+    they'll silently no-op when `import psycopg2` fails (the hooks
+    catch ImportError and emit empty output, which from the user's
+    perspective looks like the plugin "isn't doing anything" even
+    though install completed).
+
+    Falls back to sys.executable if the venv doesn't exist yet —
+    that's the case during the first install, between Setup
+    completing and the venv being fully provisioned.
+    """
+    if hook == "setup":
+        return sys.executable
+    venv = _data_root() / "venv"
+    if sys.platform.startswith("win"):
+        venv_py = venv / "Scripts" / "python.exe"
+    else:
+        # Prefer python3, fall back to python (some venvs only have
+        # the latter symlinked).
+        venv_py = venv / "bin" / "python3"
+        if not venv_py.exists():
+            alt = venv / "bin" / "python"
+            if alt.exists():
+                venv_py = alt
+    return str(venv_py) if venv_py.exists() else sys.executable
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         sys.stderr.write(
@@ -88,7 +137,8 @@ def main() -> int:
 
     fixed_args = list(EXTRA_ARGS_BY_HOOK.get(hook, ()))
     forwarded = list(sys.argv[2:])
-    cmd = [sys.executable, str(target), *fixed_args, *forwarded]
+    py = _resolve_python_for(hook)
+    cmd = [py, str(target), *fixed_args, *forwarded]
 
     if os.name == "nt":
         # Windows: subprocess.call returns the child's exit code; we

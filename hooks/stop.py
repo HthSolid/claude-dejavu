@@ -120,31 +120,74 @@ def save_chat_log_mirror(session_id: str, transcript: str) -> tuple[bool, int]:
 # ─── Step 2: incremental ingest ──────────────────────────────────────────────
 
 def ingest_incremental(session_id: str, transcript: str) -> str:
-    """Run the Python ingester for this session. Detached; non-blocking."""
+    """Run the Python ingester for this session. Detached; non-blocking.
+
+    Detachment is critical so the Stop hook returns to Claude Code in
+    milliseconds even when the ingester takes minutes to process a large
+    session. The detachment was incomplete pre-fix — only Windows got
+    DETACHED_PROCESS, while on Linux/macOS the child stayed in the
+    parent's session group and got killed by SIGHUP when Claude Code
+    closed. That used to lose ingest progress on session-end-and-quit.
+
+    Errors don't surface synchronously (we want fire-and-forget) but the
+    ingester itself logs to error_log on crashes, and dejavu doctor
+    surfaces those — closing the silent-failure loop.
+    """
     here = Path(__file__).resolve().parent
     ingester = here.parent / "code" / "ingester.py"
-    venv_py = DATA_ROOT / "venv" / ("Scripts" if sys.platform.startswith("win") else "bin") / (
-        "python.exe" if sys.platform.startswith("win") else "python3"
-    )
-    py = str(venv_py) if venv_py.exists() else sys.executable
+    # Resolve the venv python in a Windows/POSIX-safe way; fall back to
+    # the interpreter that's running this hook if the bundled venv
+    # isn't there (e.g. mid-install). The fallback path won't have
+    # psycopg2 — that fails fast with ImportError, which the ingester
+    # logs to error_log so doctor can surface it.
+    venv_dir = DATA_ROOT / "venv"
+    candidates = [
+        venv_dir / "Scripts" / "python.exe",
+        venv_dir / "bin" / "python",
+        venv_dir / "bin" / "python3",
+    ]
+    py = next((str(c) for c in candidates if c.exists()), sys.executable)
+
     log = DATA_ROOT / "ingest.log"
     payload = json.dumps({"session_id": session_id, "transcript_path": transcript})
+
+    is_windows = sys.platform.startswith("win")
+    popen_kwargs: dict = {
+        "stdin": subprocess.PIPE,
+        "stdout": open(str(log), "ab"),
+        "stderr": subprocess.STDOUT,
+    }
+    if is_windows:
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — survive parent exit.
+        popen_kwargs["creationflags"] = 0x00000008 | 0x00000200
+    else:
+        # POSIX: start_new_session() makes us a session leader, so SIGHUP
+        # to Claude Code does NOT propagate to us. close_fds prevents
+        # us from holding the parent's stdin/stdout open after detach.
+        popen_kwargs["start_new_session"] = True
+        popen_kwargs["close_fds"] = True
+
     try:
-        # Fire-and-forget: detach so the hook returns immediately
-        creationflags = 0x00000008 if sys.platform.startswith("win") else 0  # DETACHED_PROCESS
-        proc = subprocess.Popen(
-            [py, str(ingester), "--stop-hook"],
-            stdin=subprocess.PIPE,
-            stdout=open(str(log), "ab"),
-            stderr=subprocess.STDOUT,
-            close_fds=(not sys.platform.startswith("win")),
-            creationflags=creationflags,
-        )
+        proc = subprocess.Popen([py, str(ingester), "--stop-hook"], **popen_kwargs)
         proc.stdin.write(payload.encode())
         proc.stdin.close()
         return "ingest scheduled"
     except Exception as e:
-        return f"ingest skipped: {e}"
+        # Surface the schedule-time failure — the ingester never even
+        # started. Log to ingest.log AND to error_log so doctor sees it.
+        msg = f"ingest schedule failed: {type(e).__name__}: {e}"
+        try:
+            with open(str(log), "ab") as f:
+                f.write(f"[stop-hook] {msg}\n".encode())
+        except Exception:
+            pass
+        try:
+            sys.path.insert(0, str(here.parent / "code"))
+            from error_log import log_error
+            log_error("hook.stop.ingest", msg)
+        except Exception:
+            pass
+        return msg
 
 
 # ─── Step 3: throttled snapshot ──────────────────────────────────────────────

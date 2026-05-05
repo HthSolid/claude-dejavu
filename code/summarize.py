@@ -24,13 +24,26 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import urllib.request
 from datetime import datetime
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 MAX_INPUT_CHARS    = int(os.environ.get("CLAUDE_DEJAVU_SUMMARIZER_INPUT_MAX", "12000"))
-PROVIDER_TIMEOUT_S = int(os.environ.get("CLAUDE_DEJAVU_SUMMARIZER_TIMEOUT_S", "60"))
+# Lowered from 60s → 20s in v0.5.0+. The cascade has 5 providers, so worst
+# case used to be 5×60s = 5 min before falling back to the rule-based
+# digest. A single Claude Code SessionEnd hanging for 5 min was
+# unacceptable; 20s × 5 = 100s worst-case is the new ceiling, and in
+# practice providers either respond fast or we want to skip them.
+# Override via CLAUDE_DEJAVU_SUMMARIZER_TIMEOUT_S if you genuinely need
+# to wait longer for a slow remote provider.
+PROVIDER_TIMEOUT_S = int(os.environ.get("CLAUDE_DEJAVU_SUMMARIZER_TIMEOUT_S", "20"))
+# Hard ceiling on the entire cascade across all providers — a circuit
+# breaker. After this many seconds, skip remaining providers and return
+# the rule-based digest. Prevents the worst-case 5×PROVIDER_TIMEOUT_S
+# stack-up when multiple providers are slow on the same SessionEnd.
+CASCADE_TIMEOUT_S = int(os.environ.get("CLAUDE_DEJAVU_SUMMARIZER_CASCADE_TIMEOUT_S", "60"))
 
 ANTHROPIC_MODEL = os.environ.get("CLAUDE_DEJAVU_ANTHROPIC_MODEL", "claude-sonnet-4-5")
 GEMINI_MODEL    = os.environ.get("CLAUDE_DEJAVU_GEMINI_MODEL",    "gemini-2.5-flash-lite")
@@ -254,19 +267,77 @@ def _rule_based_digest(text: str) -> dict:
 
 # ─── Cascade ─────────────────────────────────────────────────────────────────
 
+# Cascade order: local-first by design (privacy + cost + offline-friendly).
+# A user's data never leaves their machine if Ollama can answer, and it
+# only walks the cloud cascade when local fails or is unavailable.
+#
+# Ordering rationale:
+#   1. ollama     — local, free, private, no auth setup needed
+#   2. claude-cli — uses the user's existing Claude Code subscription
+#                   (no API key juggling), still cloud but no extra
+#                   cost beyond what they already pay Anthropic
+#   3. anthropic  — explicit API key
+#   4. gemini     — explicit API key
+#   5. openrouter — explicit API key
+#
+# Slow-machine override: if `claude-dejavu bench` has classified the
+# machine as `perf_class=slow`, this list is reordered at runtime to
+# put cloud providers first (see `_get_providers()` below). That way
+# users with weak hardware aren't penalized by Ollama's 30s timeout
+# every session-end.
 PROVIDERS = [
+    ("ollama",       _try_ollama),
     ("claude-cli",   _try_claude_cli),
     ("anthropic",    _try_anthropic_sdk),
     ("gemini",       _try_gemini),
     ("openrouter",   _try_openrouter),
-    ("ollama",       _try_ollama),
 ]
+
+
+def _get_providers() -> list[tuple[str, callable]]:
+    """Return PROVIDERS in the right order for THIS machine.
+
+    Reads `perf_class` from config.env (set by `claude-dejavu bench`).
+    On 'slow' machines: cloud-first ordering. Otherwise: local-first.
+    """
+    try:
+        cfg_path = (
+            os.environ.get("CLAUDE_DEJAVU_DATA_ROOT") or
+            (os.environ.get("XDG_DATA_HOME", "") or "")
+        )
+        if not cfg_path:
+            from pathlib import Path as _P
+            cfg_path = str(_P.home() / ".local" / "share" / "claude-dejavu")
+        cfg_file = os.path.join(cfg_path, "config.env")
+        if os.path.exists(cfg_file):
+            for line in open(cfg_file):
+                if line.strip().startswith("PERF_CLASS="):
+                    perf = line.split("=", 1)[1].strip().strip('"\'')
+                    if perf == "slow":
+                        # Cloud-first reordering: claude-cli → anthropic →
+                        # gemini → openrouter → ollama (last).
+                        return [PROVIDERS[i] for i in (1, 2, 3, 4, 0)]
+                    break
+    except Exception:
+        pass
+    return PROVIDERS
 
 
 def generate_summary(prompt: str) -> tuple[dict, str]:
     """Walk the provider cascade. Returns (parsed_dict, model_label).
-    Falls back to rule-based digest on full failure."""
-    for _name, fn in PROVIDERS:
+    Falls back to rule-based digest on full failure or cascade timeout.
+
+    Honors CASCADE_TIMEOUT_S as a circuit breaker — if the total time
+    walking providers exceeds it, we stop trying remote providers and
+    return the rule-based digest. Prevents one slow SessionEnd from
+    stacking up across multiple slow providers."""
+    import time as _time
+    cascade_start = _time.time()
+    for _name, fn in _get_providers():
+        if (_time.time() - cascade_start) >= CASCADE_TIMEOUT_S:
+            print(f"[summarize] cascade timeout ({CASCADE_TIMEOUT_S}s), "
+                  f"falling back to rule digest", file=sys.stderr)
+            break
         text, model = fn(prompt)
         if not text:
             continue

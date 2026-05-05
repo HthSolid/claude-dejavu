@@ -35,6 +35,19 @@ SCHEMA_FILE = PLUGIN_ROOT / "code" / "schema.sql"
 WV_CLASS_FILE = PLUGIN_ROOT / "code" / "weaviate-class.json"
 
 OS_NAME = platform.system()  # 'Linux' | 'Darwin' | 'Windows'
+
+# Windows defaults stdout to cp1252 which can't encode the
+# ✓/⚠/✗/│/─/└ glyphs the installer prints. Reconfigure to UTF-8
+# so the Setup hook on Windows doesn't crash with UnicodeEncodeError
+# halfway through the install (we saw this on real installs — the
+# user's terminal showed the install hanging because the python
+# process had already died on a print).
+if sys.platform.startswith("win") and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
 OS_USER = os.environ.get("USER") or os.environ.get("USERNAME") or os.environ.get("LOGNAME") or "unknown"
 
 
@@ -105,6 +118,98 @@ def _clear_install_status() -> None:
     if p.exists():
         try: p.unlink()
         except OSError: pass
+
+
+def _fail(args, reason_code: str, summary: str,
+            fix_instructions: str = "") -> None:
+    """Hard-fail an installer step with full user-visible plumbing:
+
+      - Print red error + yellow fix hint to stderr
+      - In --auto mode, write INSTALL_STATUS so SessionStart can
+        surface the failure to Claude in-chat
+      - sys.exit(1)
+
+    Centralizing this prevents the v0.5.0d-and-earlier bug where
+    most auto-mode failures (PG timeout, schema apply, pip install,
+    Weaviate timeout) just sys.exit'd silently with no marker file
+    written — leaving the user with a "plugin enabled, nothing
+    works, no idea why" state.
+    """
+    red(f"    {summary}")
+    if fix_instructions:
+        for line in fix_instructions.splitlines():
+            yellow(f"    {line}")
+    if getattr(args, "auto", False):
+        _flag_install_incomplete(reason_code, summary, fix_instructions)
+        yellow(f"    [auto] INSTALL_STATUS marker written. "
+                f"SessionStart will surface this to Claude.")
+    sys.exit(1)
+
+
+# Bundled-stack flag so the schema applier can pick `docker exec` vs
+# host psql. Set in step_postgres when we auto-provision via Docker;
+# stays False when the user pointed install.py at their own PG.
+_USE_BUNDLED_PG_PSQL = False
+
+
+def _bundled_psql_available() -> bool:
+    """Return True iff `docker exec claude-dejavu-postgres psql` works.
+
+    Used as a Windows-friendly fallback when host psql isn't on PATH —
+    the bundled Postgres container ships psql inside it. Eliminates
+    the hard host-postgres-client dependency that previously blocked
+    every Windows install."""
+    if not shutil.which("docker"):
+        return False
+    r = subprocess.run(
+        ["docker", "exec", "claude-dejavu-postgres",
+          "psql", "--version"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return r.returncode == 0
+
+
+def _run_psql(host: str, port: str, user: str, password: str,
+                db: str | None, args_list: list[str], *,
+                input_file: Path | None = None
+                ) -> subprocess.CompletedProcess:
+    """Run a psql command via host binary OR via `docker exec` against
+    the bundled container, transparently. Hides the Windows-doesn't-
+    have-psql issue from callers."""
+    env = {**os.environ, "PGPASSWORD": password}
+    host_psql = shutil.which("psql")
+    if host_psql:
+        cmd = [host_psql, "-h", host, "-p", str(port), "-U", user]
+        if db:
+            cmd += ["-d", db]
+        if input_file:
+            cmd += ["-f", str(input_file)]
+        cmd += args_list
+        return subprocess.run(cmd, env=env, capture_output=True,
+                                  text=True)
+    if _USE_BUNDLED_PG_PSQL:
+        cmd = ["docker", "exec", "-i",
+                 "-e", f"PGPASSWORD={password}",
+                 "claude-dejavu-postgres",
+                 "psql", "-h", "localhost", "-p", "5432",
+                 "-U", user]
+        if db:
+            cmd += ["-d", db]
+        cmd += args_list
+        if input_file:
+            return subprocess.run(
+                cmd, capture_output=True, text=True,
+                input=Path(input_file).read_text(encoding="utf-8"))
+        return subprocess.run(cmd, capture_output=True, text=True)
+    # Last-ditch: caller's args_list might still work with raw shell
+    # if neither host psql nor docker is available — but practically
+    # we can't do anything. Return a fake completed process so the
+    # caller's error-path runs.
+    cp = subprocess.CompletedProcess(args=args_list, returncode=127)
+    cp.stdout = ""
+    cp.stderr = ("psql not found on host AND bundled Postgres "
+                   "container not running")
+    return cp
 
 
 def _docker_state() -> tuple[str, str]:
@@ -305,28 +410,109 @@ def step_postgres(args, data_dir: Path) -> dict:
                 _print_docker_install_instructions()
                 yellow(f"    Then re-run: python scripts/install.py")
                 sys.exit(1)
-            cyan("    Spinning up bundled Postgres + Weaviate via docker-compose…")
+            # PER-SERVICE PROBE — only spin up services that are
+            # genuinely missing. If the user already has a Weaviate
+            # running on port 8080, we DO NOT replace it with our
+            # bundled one (which would create a duplicate container
+            # + wasted resources, and could be confusing).
+            services_to_start = ["postgres"]  # always — we got here
+                                                 # because PG was missing
+            existing_wv = probe_weaviate("http://localhost:8080") \
+                            or probe_weaviate("http://localhost:8889")
+            if existing_wv:
+                green(f"    ✓ Detected existing Weaviate at "
+                        f"{existing_wv} — will reuse, NOT spinning up "
+                        f"a bundled copy.")
+            else:
+                services_to_start += ["weaviate", "transformers"]
+                yellow("    No Weaviate detected — will bring up the "
+                          "bundled stack (weaviate + transformers).")
+
+            cyan(f"    Spinning up: {', '.join(services_to_start)} "
+                    f"via docker-compose…")
+            cyan("    First-time pulls can take 2-5 min on slow "
+                    "connections.")
+            cyan("    Streaming docker output below — if it stops "
+                    "scrolling for several minutes, check your network "
+                    "or `docker pull` rate limits.")
+            print()  # blank line so docker's output stands out
             compose_file = PLUGIN_ROOT / "docker" / "docker-compose.minimal.yml"
-            r = subprocess.run(["docker", "compose", "-f", str(compose_file), "up", "-d"],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                red(f"    docker compose up failed: {r.stderr[:400]}")
-                yellow(f"    Try manually: docker compose -f {compose_file} up -d")
-                sys.exit(1)
-            # Wait for PG to become ready (up to 30s)
-            green("    Waiting for Postgres to accept connections (up to 30s)…")
+            # Stream stdout/stderr live so the user sees image-pull progress,
+            # not a silent multi-minute hang. Docker's `--progress plain`
+            # avoids ANSI cursor jumping that doesn't render well on
+            # Windows / non-tty terminals; the indent prefix makes the
+            # docker lines visually distinct from installer output.
+            try:
+                proc = subprocess.Popen(
+                    # `-p claude-dejavu` pins the Compose project name
+                    # explicitly. Without it Compose derives the project
+                    # name from the parent directory (`docker/`) — which
+                    # collides with any other stack also using `docker/`,
+                    # and Compose would remove the other stack's
+                    # containers as orphans. Defense in depth: the
+                    # compose file itself also declares `name:
+                    # claude-dejavu`.
+                    ["docker", "compose", "-p", "claude-dejavu",
+                      "-f", str(compose_file),
+                      "--progress", "plain", "up", "-d",
+                      *services_to_start],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+            except FileNotFoundError:
+                _fail(args, "docker_missing_runtime",
+                        "docker binary disappeared between probe and "
+                        "compose call",
+                        _docker_install_instructions())
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                # Strip trailing newline; print with indent prefix.
+                sys.stdout.write(f"      │ {line.rstrip()}\n")
+                sys.stdout.flush()
+            rc = proc.wait()
+            print()  # blank line after docker output
+            if rc != 0:
+                _fail(args, "docker_compose_up_failed",
+                        f"docker compose up failed (exit {rc})",
+                        f"Try manually: docker compose -p claude-dejavu "
+                        f"-f {compose_file} up -d\n"
+                        f"Then re-run: python scripts/install.py --auto")
+            # Wait for PG to become ready (up to 60s — first start with
+            # a fresh volume can be slow on low-resource VMs / Windows).
+            green("    Waiting for Postgres to accept connections "
+                    "(up to 60s)…")
             ready = False
             last_reason = ""
-            for i in range(30):
+            import time as _t
+            for i in range(60):
                 ok, why = probe_pg("localhost", 5454)
                 if ok:
                     ready = True; break
                 last_reason = why
-                import time as _t; _t.sleep(1)
+                # Heartbeat every second so the user knows we're still
+                # alive. Carriage-return-based update on TTYs; plain on
+                # non-TTYs (CI / Windows cmd may not handle \r cleanly).
+                if sys.stdout.isatty():
+                    sys.stdout.write(f"\r      … waiting {i+1}/60s "
+                                          f"({last_reason[:40]})   ")
+                    sys.stdout.flush()
+                else:
+                    if i % 5 == 0:  # every 5s on non-TTY
+                        print(f"      … still waiting ({i+1}/60s): "
+                                f"{last_reason[:60]}")
+                _t.sleep(1)
+            if sys.stdout.isatty():
+                sys.stdout.write("\r" + " " * 70 + "\r")
             if not ready:
-                red(f"    Postgres didn't come up within 30s ({last_reason}). Check `docker logs claude-dejavu-postgres`")
-                sys.exit(1)
+                _fail(args, "postgres_timeout",
+                        f"Postgres didn't come up within 60s "
+                        f"({last_reason})",
+                        "Check `docker logs claude-dejavu-postgres` "
+                        "for the actual startup error, then re-run "
+                        "scripts/install.py --auto")
             host, port, user, password = "localhost", "5454", "postgres", "postgres"
+            global _USE_BUNDLED_PG_PSQL
+            _USE_BUNDLED_PG_PSQL = True
             green(f"    ✓ Bundled Postgres up on {host}:{port}")
         else:
             host = ask("    PG host", "localhost", args.non_interactive)
@@ -337,37 +523,139 @@ def step_postgres(args, data_dir: Path) -> dict:
     db = f"claude_dejavu_team" if args.shared else f"claude_dejavu_{OS_USER}"
     db = ask("    PG database name", db, args.non_interactive)
 
-    # Create DB + apply schema using psql if available.
-    psql = shutil.which("psql")
-    if not psql:
-        red("    psql not found in PATH.")
+    # Create DB + apply schema. Prefer host psql; fall back to
+    # `docker exec` against the bundled container — this removes the
+    # Windows hard-dependency on installing postgres-client manually.
+    host_psql = shutil.which("psql")
+    if not host_psql and not _USE_BUNDLED_PG_PSQL:
+        fix_lines = []
         if OS_NAME == "Linux":
-            yellow("    Install: sudo apt install postgresql-client      (Debian/Ubuntu)")
-            yellow("             sudo dnf install postgresql              (Fedora/RHEL)")
-            yellow("             sudo pacman -S postgresql-libs           (Arch)")
+            fix_lines = [
+                "Install postgres-client:",
+                "  sudo apt install postgresql-client      (Debian/Ubuntu)",
+                "  sudo dnf install postgresql              (Fedora/RHEL)",
+                "  sudo pacman -S postgresql-libs           (Arch)",
+            ]
         elif OS_NAME == "Darwin":
-            yellow("    Install: brew install libpq && brew link --force libpq")
+            fix_lines = ["Install: brew install libpq && "
+                          "brew link --force libpq"]
         elif OS_NAME == "Windows":
-            yellow("    Install: download Postgres installer from https://www.postgresql.org/download/windows/")
-            yellow("    Or use scoop: scoop install postgresql")
-        yellow("    Then re-run: python3 scripts/install.py")
-        sys.exit(1)
-    env = {**os.environ, "PGPASSWORD": password}
-    # Create DB if missing (idempotent)
-    subprocess.run([psql, "-h", host, "-p", port, "-U", user, "-tc",
-                    f"SELECT 1 FROM pg_database WHERE datname='{db}'"],
-                   env=env, capture_output=True)
-    subprocess.run([psql, "-h", host, "-p", port, "-U", user,
-                    "-c", f"CREATE DATABASE {db}"],
-                   env=env, capture_output=True)
-    r = subprocess.run([psql, "-h", host, "-p", port, "-U", user, "-d", db,
-                        "-f", str(SCHEMA_FILE)],
-                       env=env, capture_output=True, text=True)
+            fix_lines = [
+                "Install postgres-client (psql.exe):",
+                "  winget install PostgreSQL.PostgreSQL    (recommended)",
+                "  scoop install postgresql                 (alternative)",
+            ]
+        fix_lines.append("Then re-run: python scripts/install.py --auto")
+        _fail(args, "psql_missing",
+                "psql not found in PATH and bundled Postgres "
+                "container is not in use.",
+                "\n".join(fix_lines))
+    if not host_psql and _USE_BUNDLED_PG_PSQL:
+        cyan(f"    Using `docker exec claude-dejavu-postgres psql` "
+                f"(host psql not on PATH — Windows-friendly path).")
+
+    # Create DB if missing (idempotent). The CREATE DATABASE may emit
+    # "already exists" — that's fine, we ignore the return code on
+    # the create call.
+    _run_psql(host, port, user, password, None, [
+        "-tc", f"SELECT 1 FROM pg_database WHERE datname='{db}'"
+    ])
+    _run_psql(host, port, user, password, None, [
+        "-c", f"CREATE DATABASE {db}"
+    ])
+    r = _run_psql(host, port, user, password, db, [],
+                      input_file=SCHEMA_FILE)
     if r.returncode != 0:
-        red(f"    schema apply failed: {r.stderr[:300]}")
-        sys.exit(1)
+        _fail(args, "schema_apply_failed",
+                f"schema apply failed",
+                f"psql stderr: {(r.stderr or '')[:300]}\n"
+                f"Re-run: python scripts/install.py --auto\n"
+                f"If persistent, manually: psql -h {host} -p {port} "
+                f"-U {user} -d {db} -f code/schema.sql")
+
+    # Apply any column-level / type-change / rename migrations on top
+    # of the base schema. New tables are handled by schema.sql itself
+    # (CREATE TABLE IF NOT EXISTS), so this only runs for changes
+    # that can't be expressed idempotently in schema.sql.
+    _apply_schema_migrations(args, host, port, user, password, db)
+
     green(f"  ✓ Database {db} ready on {host}:{port}")
     return {"PG_HOST": host, "PG_PORT": port, "PG_USER": user, "PG_PASS": password, "PG_DB": db}
+
+
+def _apply_schema_migrations(args, host: str, port: str, user: str,
+                                password: str, db: str) -> None:
+    """Apply forward-only migrations from code/migrations/.
+
+    Idempotent. Tracks applied migrations in the
+    `_dejavu_schema_versions` table, which we create on first run.
+    Each migration file is `NNNN_description.sql`. See
+    code/migrations/README.md for the full design + naming rules.
+
+    Failures use the standard _fail() path so SessionStart can
+    surface them in --auto mode.
+    """
+    migrations_dir = PLUGIN_ROOT / "code" / "migrations"
+    if not migrations_dir.is_dir():
+        return  # No migrations directory — nothing to apply
+
+    # Discover .sql files (filename-sorted)
+    candidates = sorted(p for p in migrations_dir.glob("*.sql")
+                              if p.is_file())
+    if not candidates:
+        return  # Empty migrations dir — nothing to apply
+
+    # Bootstrap the version table.
+    r = _run_psql(host, port, user, password, db, [
+        "-c",
+        "CREATE TABLE IF NOT EXISTS _dejavu_schema_versions ("
+        "  name TEXT PRIMARY KEY, "
+        "  applied_at TIMESTAMPTZ DEFAULT now()"
+        ")",
+    ])
+    if r.returncode != 0:
+        _fail(args, "schema_versions_table_failed",
+                "Could not create _dejavu_schema_versions table",
+                f"psql stderr: {(r.stderr or '')[:300]}")
+
+    # Read already-applied set.
+    r = _run_psql(host, port, user, password, db, [
+        "-tA", "-c", "SELECT name FROM _dejavu_schema_versions",
+    ])
+    if r.returncode != 0:
+        _fail(args, "schema_versions_query_failed",
+                "Could not read _dejavu_schema_versions",
+                f"psql stderr: {(r.stderr or '')[:300]}")
+    applied = {ln.strip() for ln in (r.stdout or "").splitlines()
+                  if ln.strip()}
+
+    pending = [p for p in candidates if p.name not in applied]
+    if not pending:
+        return  # Everything's applied
+
+    cyan(f"    Applying {len(pending)} schema migration(s)…")
+    for mig in pending:
+        cyan(f"      → {mig.name}")
+        r = _run_psql(host, port, user, password, db, [],
+                          input_file=mig)
+        if r.returncode != 0:
+            _fail(args, "migration_apply_failed",
+                    f"Migration {mig.name} failed",
+                    f"psql stderr: {(r.stderr or '')[:300]}\n"
+                    f"Migrations are forward-only — fix the .sql or "
+                    f"manually clean up partial state, then re-run "
+                    f"install.py --auto.")
+        # Record in version table only after successful apply.
+        # ON CONFLICT no-op handles the case where the migration
+        # itself self-recorded (some migrations may want to be
+        # transactional with their own version row insert).
+        _run_psql(host, port, user, password, db, [
+            "-c",
+            f"INSERT INTO _dejavu_schema_versions (name) "
+            f"VALUES ('{mig.name}') "
+            f"ON CONFLICT (name) DO NOTHING"
+        ])
+    green(f"    ✓ {len(pending)} migration(s) applied")
 
 
 # ─── Step 3: Weaviate ────────────────────────────────────────────────────────
@@ -394,13 +682,44 @@ def step_weaviate(args, data_dir: Path) -> dict:
             sys.exit(0)
         if choice in ("a", "auto", ""):
             if not shutil.which("docker"):
-                red("    Docker not found in PATH. See docs/INSTALL.md to install Docker.")
-                sys.exit(1)
+                _fail(args, "docker_missing",
+                        "Docker not found in PATH",
+                        _docker_install_instructions())
             # docker-compose.minimal.yml brings up weaviate + transformers along with postgres
             compose_file = PLUGIN_ROOT / "docker" / "docker-compose.minimal.yml"
-            cyan("    Bringing up Weaviate via docker-compose…")
-            subprocess.run(["docker", "compose", "-f", str(compose_file), "up", "-d", "weaviate", "transformers"],
-                           capture_output=True, text=True)
+            cyan("    Bringing up Weaviate + transformers via "
+                    "docker-compose…")
+            cyan("    First-time pulls download the embedding model "
+                    "(~110 MB) — can take 2-5 min on slow links.")
+            cyan("    Streaming docker output below — if it stops "
+                    "scrolling for several minutes, check your network.")
+            print()
+            try:
+                wv_proc = subprocess.Popen(
+                    ["docker", "compose", "-p", "claude-dejavu",
+                      "-f", str(compose_file),
+                      "--progress", "plain", "up", "-d",
+                      "weaviate", "transformers"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+            except FileNotFoundError:
+                _fail(args, "docker_missing_runtime",
+                        "docker binary disappeared between probe and "
+                        "compose call",
+                        _docker_install_instructions())
+            assert wv_proc.stdout is not None
+            for line in wv_proc.stdout:
+                sys.stdout.write(f"      │ {line.rstrip()}\n")
+                sys.stdout.flush()
+            rc = wv_proc.wait()
+            print()
+            if rc != 0:
+                _fail(args, "docker_compose_up_failed_weaviate",
+                        f"docker compose up weaviate failed (exit {rc})",
+                        f"Try manually: docker compose -p claude-dejavu "
+                        f"-f {compose_file} up -d weaviate transformers\n"
+                        f"Then re-run: python scripts/install.py --auto")
             green("    Waiting for Weaviate to be ready (up to 60s — first start pulls model)…")
             import time as _t
             for i in range(60):
@@ -408,10 +727,23 @@ def step_weaviate(args, data_dir: Path) -> dict:
                 if meta:
                     detected = "http://localhost:8889"
                     break
+                if sys.stdout.isatty():
+                    sys.stdout.write(f"\r      … waiting {i+1}/60s   ")
+                    sys.stdout.flush()
+                elif i % 5 == 0:
+                    print(f"      … still waiting ({i+1}/60s)")
                 _t.sleep(1)
+            if sys.stdout.isatty():
+                sys.stdout.write("\r" + " " * 70 + "\r")
             if not detected:
-                red("    Weaviate didn't come up within 60s. Check `docker logs claude-dejavu-weaviate`")
-                sys.exit(1)
+                _fail(args, "weaviate_timeout",
+                        "Weaviate didn't come up within 60s",
+                        "Check `docker logs claude-dejavu-weaviate` "
+                        "for the actual startup error. First start may "
+                        "be slow because the transformers-inference "
+                        "container downloads the embedding model "
+                        "(~110 MB). Re-run: python scripts/install.py "
+                        "--auto")
             green(f"    ✓ Bundled Weaviate up on {detected}")
 
     wv_url = detected or ask("    Weaviate URL", "http://localhost:8080", args.non_interactive)
@@ -441,23 +773,69 @@ def step_venv(args, data_dir: Path) -> Path:
     cyan("[4/6] Python virtualenv")
     venv_dir = data_dir / "venv"
     if not venv_dir.exists():
-        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+        cyan(f"    Creating venv at {venv_dir} (one-time, ~5s)…")
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)],
+                          check=True)
+    else:
+        cyan(f"    Reusing existing venv at {venv_dir}")
     bin_dir = venv_dir / ("Scripts" if OS_NAME == "Windows" else "bin")
     py = bin_dir / ("python.exe" if OS_NAME == "Windows" else "python3")
     pip = bin_dir / ("pip.exe" if OS_NAME == "Windows" else "pip")
-    subprocess.run([str(pip), "install", "--quiet", "--upgrade", "pip"], capture_output=True)
-    subprocess.run([str(pip), "install", "--quiet",
-                    "psycopg2-binary", "mcp",
-                    # tree-sitter for accurate code symbol grounding (v0.3.0+).
-                    # Pinned to known-good wheel-shipping versions so installs are
-                    # offline-capable on Linux/macOS/Windows. If wheels are
-                    # unavailable on a given platform, the indexer transparently
-                    # falls back to the regex/ast parsers — install still succeeds.
-                    "tree-sitter==0.21.3", "tree-sitter-languages==1.10.2",
-                    # PyYAML for parsing OpenAPI/Swagger YAML files in the
-                    # route indexer (v0.3.2.1+). Falls back to no-op if absent.
-                    "pyyaml>=6.0"],
-                   capture_output=True)
+
+    # Two pip install rounds (pip itself + the dejavu deps). Both can
+    # take 30-90s on slow connections — surface progress instead of
+    # silent waits. We don't stream pip output by default (it's
+    # noisy); a periodic heartbeat is enough for the user to know
+    # the install is alive.
+    cyan("    Upgrading pip…")
+    subprocess.run([str(pip), "install", "--quiet", "--upgrade", "pip"],
+                      capture_output=True)
+    cyan("    Installing dependencies "
+            "(psycopg2-binary, mcp, tree-sitter, tree-sitter-languages, "
+            "pyyaml). First-time install can take 30-90s on slow "
+            "connections — please wait…")
+    pip_proc = subprocess.Popen(
+        [str(pip), "install",
+          "psycopg2-binary", "mcp",
+          # tree-sitter for accurate code symbol grounding (v0.3.0+).
+          # Pinned to known-good wheel-shipping versions so installs
+          # are offline-capable on Linux/macOS/Windows. If wheels are
+          # unavailable on a given platform, the indexer transparently
+          # falls back to the regex/ast parsers — install still
+          # succeeds.
+          "tree-sitter==0.21.3", "tree-sitter-languages==1.10.2",
+          # PyYAML for parsing OpenAPI/Swagger YAML files in the
+          # route indexer (v0.3.2.1+). Falls back to no-op if absent.
+          "pyyaml>=6.0"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        bufsize=1)
+    assert pip_proc.stdout is not None
+    # Stream pip's per-line output — keeps the user informed during
+    # what was previously a silent multi-minute wait. We indent so
+    # pip lines are visually distinct from the installer's own.
+    for line in pip_proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        # Skip the very-noisy "Downloading X-Y.Z (...)" lines but keep
+        # "Collecting", "Installing", and any error/warning output.
+        if line.startswith(("Downloading ", "  Downloading ")):
+            # Show downloads as a single dot so the screen doesn't
+            # flood with progress bars.
+            sys.stdout.write(".")
+            sys.stdout.flush()
+            continue
+        sys.stdout.write(f"\n      │ {line}")
+        sys.stdout.flush()
+    print()  # final newline after the dotted progress line
+    rc = pip_proc.wait()
+    if rc != 0:
+        _fail(args, "pip_install_failed",
+                f"pip install failed (exit {rc})",
+                f"Check pip output above for the actual error. "
+                f"Common causes: no network, missing C compiler for "
+                f"a wheel that fell back to source build, disk full. "
+                f"Re-run: python scripts/install.py --auto")
     green(f"  ✓ venv at {venv_dir}")
     return venv_dir
 
@@ -495,7 +873,14 @@ def step_config(args, data_dir: Path, pg: dict, wv: dict, venv: Path):
             != _default_data_root().resolve()):
         bin_dir = data_root() / "bin"
     elif OS_NAME == "Windows":
-        bin_dir = Path.home() / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+        # Place inside our own data dir, NOT in the system-reserved
+        # Microsoft\WindowsApps. The latter is read-only for regular
+        # users on locked-down Windows installs (managed devices /
+        # corp policies / antivirus quarantine), so writing the .bat
+        # silently fails and the user has no `claude-dejavu` on PATH
+        # despite the install reporting "complete". Per-user data dir
+        # is always writable.
+        bin_dir = data_root() / "bin"
     else:
         bin_dir = Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -503,14 +888,28 @@ def step_config(args, data_dir: Path, pg: dict, wv: dict, venv: Path):
     if OS_NAME == "Windows":
         cli_path = bin_dir / "claude-dejavu.bat"
         cli_path.write_text(
-            f'@echo off\n'
-            f'"{venv / "Scripts" / "python.exe"}" "{PLUGIN_ROOT / "code" / "recall.py"}" %*\n'
+            f'@echo off\r\n'
+            f'"{venv / "Scripts" / "python.exe"}" '
+            f'"{PLUGIN_ROOT / "code" / "recall.py"}" %*\r\n'
         )
     else:
         cli_path = bin_dir / "claude-dejavu"
+        # Generate a wrapper that prefers python3 but falls back to
+        # python — handles edge-case venvs that only symlink one or
+        # the other (rare but real on stripped Linux installs).
         cli_path.write_text(
             f'#!/bin/bash\n'
-            f'exec "{venv / "bin" / "python3"}" "{PLUGIN_ROOT / "code" / "recall.py"}" "$@"\n'
+            f'if [ -x "{venv / "bin" / "python3"}" ]; then\n'
+            f'  exec "{venv / "bin" / "python3"}" '
+            f'"{PLUGIN_ROOT / "code" / "recall.py"}" "$@"\n'
+            f'elif [ -x "{venv / "bin" / "python"}" ]; then\n'
+            f'  exec "{venv / "bin" / "python"}" '
+            f'"{PLUGIN_ROOT / "code" / "recall.py"}" "$@"\n'
+            f'else\n'
+            f'  echo "claude-dejavu: venv python not found — '
+            f're-run install.py" >&2\n'
+            f'  exit 1\n'
+            f'fi\n'
         )
         cli_path.chmod(0o755)
     green(f"  ✓ CLI: {cli_path}")
@@ -800,7 +1199,19 @@ def _normalize_mcp_json() -> None:
 
     Also handles hooks.json — including the Setup hook itself, so plugin
     updates that re-trigger Setup will use the right python.
+
+    SKIPPED when running from a git clone (PLUGIN_ROOT/.git exists).
+    Mutating the source files there would leave the working tree dirty
+    and confuse `git status` for contributors. Marketplace installs
+    live in per-version cache dirs that are safe to mutate.
     """
+    if (PLUGIN_ROOT / ".git").is_dir():
+        cyan("    Skipping .mcp.json normalization "
+                "(running from a git clone — would dirty the tree). "
+                "If you need OS-correct command tokens for local dev, "
+                "edit .mcp.json + hooks/hooks.json by hand.")
+        return
+
     target_cmd = "python" if OS_NAME == "Windows" else "python3"
 
     # 1. .mcp.json

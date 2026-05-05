@@ -4,6 +4,129 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.5.0e] — 2026-05-05
+
+Reliability + observability overhaul. **Closes the silent-ingest-failure
+class of bugs** that caused entire sessions to be missing from the
+search index without warning.
+
+### Fixed
+
+- **Ingest no longer aborts on NUL-byte rows.** Pre-fix, a single turn
+  whose text contained `\x00` (common when tool outputs captured
+  binary or truncated-terminal data) raised `ValueError: A string
+  literal cannot contain NUL` from `psycopg2.cur.execute()`, aborted
+  the whole session ingest, and left the cursor un-advanced so every
+  subsequent SessionEnd re-failed at the same byte. Sessions with
+  even one NUL byte were silently lost. Fix: `_strip_nul()` recursive
+  helper applied at every text boundary (turn content, tool_input,
+  gist, file_path) before any PG insert.
+- **Per-line try/except in ingest loop.** One bad turn no longer
+  aborts the whole session. The loop catches the exception, rolls
+  back the aborted PG transaction (otherwise psycopg2 enters
+  `InFailedSqlTransaction` state and breaks every subsequent
+  statement), advances the cursor past the bad line, and continues.
+- **Stop hook on Linux/macOS now uses `start_new_session=True`.**
+  Pre-fix only Windows got `DETACHED_PROCESS`; on POSIX the ingester
+  child stayed in the parent's process group and got SIGHUP'd when
+  Claude Code closed. Long ingests of multi-MB sessions used to die
+  at Claude-Code-quit.
+- **Cascade reorder for slow machines.** `summarize.py` reads
+  `PERF_CLASS=slow` from `config.env` and dynamically reorders the
+  provider cascade to put cloud (Anthropic / Gemini / OpenRouter)
+  first when local Ollama is too slow. Saves a 30s × N providers
+  walk on weak machines.
+- **`fh.tell()` replaced with byte-accumulator** for cursor offsets.
+  Python's text-mode iterator (`for line in fh`) uses a readahead
+  buffer that disables `tell()`. Cursor's `last_byte` now tracks
+  `sum(len(line.encode(...)))` so partial-progress saves reflect the
+  actual byte offset.
+- **Silent `make_gist()` Ollama call removed from ingest hot path.**
+  `make_gist` ignored `prefer_llm=False` for assistant text ≥1000
+  chars, calling Ollama with a 30s urllib timeout per turn — a
+  32 MB session blocked for 45 minutes pre-fix. Ingester now imports
+  `rule_gist` directly, never reaches the LLM cascade.
+
+### Added
+
+- **Per-session ingest lock.** `$DATA_ROOT/locks/ingest-<sid>.lock`
+  with `O_CREAT|O_EXCL` atomic create + 30-min stale-reaping.
+  Prevents two stop-hooks (e.g. from concurrent Claude Code sessions)
+  from racing on the same session's PG row locks. Released via outer
+  try/finally — guaranteed cleanup on any exit path.
+- **Periodic durable progress.** Cursor commits every 500 successful
+  turns instead of only at end-of-file. A 32 MB session that crashes
+  at line 18,000 now keeps ~17,500 lines of forward progress on the
+  next run instead of redoing from scratch.
+- **Progress heartbeat.** Stderr line every 250 turns:
+  `[ingest] aabbccdd line=12345 bytes=1.5M/10M (15%) +250t 7t/s 32s`.
+  Visible during interactive `reingest` and in `ingest.log` for
+  detached stop-hook runs. Final completion line always emitted.
+- **`claude-dejavu reingest` CLI** for crash recovery. Three modes:
+  `--reingest --session SID` (clear cursor + re-ingest one),
+  `--reingest --missing-only` (re-ingest only sessions whose .jsonl
+  exists on disk but is absent from the index — gap recovery without
+  disturbing complete sessions), `--reingest` (full re-scan).
+- **`--workers N` parallel reingest.** Each worker has its own PG
+  connection. Recovering 10 missing sessions drops from sequential
+  ~8 min to parallel ~2 min with `--workers 4`.
+- **`claude-dejavu bench`** — measures local Ollama gist latency on
+  a 1 KB sample, classifies the machine as `fast` or `slow`,
+  persists `PERF_CLASS=...` to `config.env` with `--apply`.
+- **`doctor` `_check_perf_class`** — surfaces slow-machine warning
+  with fix message pointing at cloud API key setup or Pro tier.
+- **`doctor` `_check_ingest_coverage`** — walks
+  `~/.claude/projects/`, checks each .jsonl against the
+  `ingest_cursors` table, flags sessions present on disk but missing
+  from the index. Surfaces `warn` with `claude-dejavu reingest
+  --missing-only` as the fix.
+- **`error_log` integration in ingester.** Top-level uncaught
+  exceptions go to the structured error log via
+  `error_log.log_error()`. Combined with stop.py's schedule-failure
+  capture, the silent-failure surface is closed — ingester crashes
+  show up in `dejavu doctor` output instead of vanishing into
+  `ingest.log`.
+- **Adversarial test suite** (`tests/test_ingester_adversarial.py`)
+  — 23 PG-dependent assertions: NUL bytes mid-stream, malformed JSON
+  line, latin-1 / non-UTF-8 bytes, single 200 KB turn, no-network
+  mode (OLLAMA_URL unreachable), cursor invariants, real-PG
+  concurrency (two ingesters, one defers via lock), observability
+  (deliberate failure → error_log record), fault injection (bad
+  UUID at a specific line, surrounding good turns must survive).
+- **`tests/_deadline.py`** — cross-platform `with deadline(seconds)`
+  context manager (SIGALRM on POSIX, watchdog on Windows). Catches
+  the entire "blocking call in hot path" regression class.
+
+### Changed
+
+- `code/summarize.py` cascade reordered local-first by default:
+  `ollama → claude-cli → anthropic → gemini → openrouter`. On
+  `perf_class=slow` machines, runtime flips it to cloud-first.
+- `summarize.py` per-provider timeout 60s → 20s. New
+  `CASCADE_TIMEOUT_S=60s` total-walk circuit breaker.
+- Test count: 168 → **293 infra-free + 23 PG-dependent** (316 total).
+
+### Documentation
+
+- `docs/TROUBLESHOOTING.md` — new sections "Sessions show as missing
+  from the index" (with `reingest --missing-only` recipe) and
+  "I edited the plugin source but my changes don't take effect"
+  (with the `~/.claude/plugins/cache/` refresh recipe).
+
+### Parallel install / health work (also in this release)
+
+- **`scripts/install.py`** — major overhaul (per-service Docker
+  probe, streaming compose output, install responsiveness fixes).
+- **`code/health.py` + `tests/test_health.py`** — schema +
+  Weaviate-class integrity checks with auto-recovery (re-apply
+  `schema.sql`, re-create Weaviate class, re-ingest from off-tree
+  backup if data loss is detected).
+- **`code/migrations/`** — schema-evolution directory + README for
+  changes that `CREATE TABLE IF NOT EXISTS` can't express.
+- **`bin/dejavu-hook.py`** + **`hooks/session_start.py`** —
+  cross-platform hook dispatcher hardening.
+- **`docker/docker-compose.minimal.yml`** — minor compose tweaks.
+
 ## [0.5.0d] — 2026-05-05
 
 Cross-platform install fix. **Critical for Windows users.**

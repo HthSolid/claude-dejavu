@@ -337,15 +337,21 @@ def _build_preamble(latest_summary: dict | None, observations: list[dict],
                     update_notice: str | None = None,
                     reindex_notice: str | None = None,
                     install_notice: str | None = None,
-                    bootstrap_notice: str | None = None) -> str:
+                    bootstrap_notice: str | None = None,
+                    health_notice: str | None = None) -> str:
     if not any([latest_summary, observations, update_notice, reindex_notice,
-                install_notice, bootstrap_notice]):
+                install_notice, bootstrap_notice, health_notice]):
         return ""
     lines = ["[claude-dejavu — context from prior sessions on this project]"]
     # Install status comes FIRST — if install is incomplete, nothing else
     # works and the user needs to see this before any normal preamble noise.
     if install_notice:
         lines.append(install_notice)
+    # Health-repair notice next — if storage was just auto-repaired
+    # the user needs to know (their data may have been lost; auto-
+    # repair only restores schema, not contents).
+    if health_notice:
+        lines.append(health_notice)
     if update_notice:
         lines.append(update_notice)
     if bootstrap_notice:
@@ -409,8 +415,36 @@ def main():
     observations: list[dict] = []
     reindex_notice: str | None = None
     bootstrap_notice: str | None = None
+    health_notice: str | None = None
     try:
         with psycopg2.connect(_pg_dsn(cfg)) as conn:
+            # Storage-integrity check + auto-repair. Closes the silent-
+            # failure loop where Postgres or Weaviate is reachable but
+            # our tables / classes are gone (orphan-container destruction
+            # from Compose project-name collision, manual `docker compose
+            # down -v`, fresh container against a stale config.env, etc.).
+            # Without this, every query below would raise, get caught by
+            # the broad except, and the user would see an empty preamble
+            # with no idea why nothing is working.
+            try:
+                from health import (check_and_repair_storage,
+                                          format_repair_notice)
+                report = check_and_repair_storage(
+                    conn=conn,
+                    wv_url=cfg.get("WV_URL"),
+                    auto_repair=(cfg.get("AUTO_HEAL_STORAGE", "true")
+                                  .lower() not in ("0", "false", "no",
+                                                     "off")),
+                )
+                health_notice = format_repair_notice(report)
+            except Exception as e:  # noqa: BLE001
+                # Health module load failure or unhandled error — still
+                # try to use the connection for the preamble queries
+                # below. We don't want a bug in health.py to break the
+                # whole hook.
+                health_notice = (f"[claude-dejavu] storage health "
+                                    f"check errored: "
+                                    f"{type(e).__name__}: {e}")
             cur = conn.cursor()
             # Latest summary for this project (skip the current session itself)
             cur.execute("""
@@ -459,7 +493,8 @@ def main():
                           update_notice=update_notice,
                           reindex_notice=reindex_notice,
                           install_notice=install_notice,
-                          bootstrap_notice=bootstrap_notice if 'bootstrap_notice' in dir() else None)
+                          bootstrap_notice=bootstrap_notice if 'bootstrap_notice' in dir() else None,
+                          health_notice=health_notice)
     print(json.dumps({"systemMessage": msg}))
 
 

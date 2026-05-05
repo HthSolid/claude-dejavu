@@ -8,7 +8,7 @@ auto-diagnoses everything below and tells you exactly what to fix.
 
 ```bash
 # Inside Claude Code:
-/dejavu-doctor
+/claude-dejavu:dejavu-doctor
 
 # Or from a terminal:
 claude-dejavu doctor
@@ -18,6 +18,11 @@ The output is self-explanatory: each check reports `ok` / `warn` /
 `fail`, and failed checks include a `→ fix:` line you can copy-paste.
 
 ---
+
+Make sure to run the installation script: 
+```bash
+python C:\Users\<your_user>\.claude\plugins\cache\claude-dejavu\claude-dejavu\<latest_version>\scripts\install.py --auto"
+```
 
 ## Quick reference — common error messages
 
@@ -116,6 +121,52 @@ docker restart claude-dejavu-transformers
 ---
 
 ## Runtime troubleshooting
+
+### "Sessions show as missing from the index"
+
+Symptom: `dejavu_search` doesn't return any hits from a recent session, or
+`claude-dejavu doctor` shows `ingest_coverage: warn — N never ingested`.
+
+This used to happen silently when an ingester crashed mid-session. As of
+v0.5.0+ ingest is durably-resumable and crash-resilient (per-session
+lock, NUL-byte sanitization, periodic cursor commits), but historical
+gaps from earlier versions still need a one-shot recovery.
+
+```bash
+# Recover all sessions that exist on disk but aren't in the index.
+# Runs in parallel — pick `--workers` to match your CPU/IO budget.
+claude-dejavu reingest --missing-only --workers 4
+
+# Or re-ingest one specific session (clears its cursor first):
+claude-dejavu reingest --session <session-uuid>
+
+# Full re-scan (clears ALL cursors, walks every jsonl from scratch):
+claude-dejavu reingest
+```
+
+Each run prints a per-session progress heartbeat to stderr every ~250
+turns so you can see forward motion without polling Postgres.
+
+### "I edited the plugin source but my changes don't take effect"
+
+Claude Code doesn't run hooks from your working tree — it runs them
+from `~/.claude/plugins/cache/claude-dejavu/<version>/`. After editing
+the plugin source:
+
+```bash
+# 1. Update the marketplace clone (Linux/macOS):
+cd ~/.claude/plugins/marketplaces/claude-dejavu
+git fetch origin main && git reset --hard origin/main
+
+# 2. Re-run install.py from the updated clone:
+python ~/.claude/plugins/marketplaces/claude-dejavu/scripts/install.py
+
+# 3. Restart Claude Code so it re-reads the plugin manifest.
+```
+
+Or for development against a *local* working tree (not the marketplace
+clone), set `CLAUDE_PLUGIN_ROOT_OVERRIDE=<your-path>` in your shell
+before launching Claude Code, and the hooks resolve from there.
 
 ### "Lint isn't catching fabricated names"
 

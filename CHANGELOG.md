@@ -4,6 +4,37 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.5.0c] — 2026-05-04
+
+Troubleshooting documentation release. Pure docs — no code changes.
+
+### Added
+
+- `docs/TROUBLESHOOTING.md` — comprehensive install + runtime
+  troubleshooting guide, written from a real user's
+  Windows-with-Docker-not-running install journey. Covers:
+
+  - **Quick reference table** mapping every observed error message
+    (e.g. `MCP error -32000: Connection closed`) to its meaning +
+    the exact fix command.
+  - **Install resume flow**: the installer is idempotent — re-running
+    after fixing the underlying issue picks up where it left off.
+  - **Common install failures**: Docker not running, PG / Weaviate
+    startup hangs, port conflicts (auto-handled), CLI shim PATH.
+  - **Runtime issues**: lint not catching fabrications (reindex
+    needed), missing slash commands (`/plugin update` flow),
+    sessions not mirrored, slow reindex.
+  - **Windows-specific notes**: Docker Desktop must be RUNNING (not
+    just installed), WSL2 backend recommended, antivirus exclusion
+    paths, PATH/shim resolution on PowerShell.
+  - **Bug-report template**: the three things we need (command +
+    `dejavu doctor` output + `dejavu logs --with-traceback`).
+  - **Diagnostic command cheat sheet** + nuclear-option full
+    re-install.
+
+- README install section now links to the new troubleshooting
+  guide so users find it before they get stuck.
+
 ## [0.5.0b] — 2026-05-04
 
 Governance release. Pure docs / project-meta — no code changes.

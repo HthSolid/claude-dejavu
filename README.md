@@ -230,6 +230,12 @@ All hooks, the MCP server, and the CLI are pure Python.
 | `/dejavu-doctor` | Diagnose install + runtime health |
 | `/dejavu-config` | Read/change settings (lint mode, scope defaults, …) |
 
+> **Install or runtime trouble?** See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+> for common errors (Docker not running, port conflicts, stale install
+> cache, Windows-specific notes) and how to fix each one. Always
+> start with `/dejavu-doctor` — it auto-diagnoses and prints
+> copy-pasteable fix commands for every failed check.
+
 ---
 
 ## How it works

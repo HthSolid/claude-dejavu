@@ -193,6 +193,32 @@ claude-dejavu reindex --force
 
 ## Windows-specific notes
 
+### `python` must be on PATH (the canonical Python command)
+
+The plugin's hooks invoke `python "${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py"`.
+On Windows that's the standard install command — the official
+Python installer creates `python.exe` and `py.exe`.
+
+If `python --version` works in PowerShell, you're set.
+
+If it doesn't:
+1. Install Python 3.10+ from <https://python.org>. **Tick the
+   "Add Python to PATH" checkbox** in the installer (it's off by
+   default).
+2. Or use `py.exe` (always present after Python install) by
+   creating an alias: open PowerShell as admin and run
+   `New-Alias -Name python -Value py -Scope Global -Force`. Add
+   that to your PowerShell profile to persist.
+
+On **Linux** (especially Ubuntu 22.04+), `python` may not exist
+even though `python3` does. Install the alias package:
+```bash
+sudo apt install python-is-python3
+```
+On macOS modern installers ship `python3` but not always `python`.
+Either install `python` via Homebrew (`brew install python`) or
+ensure your `python3` binary is symlinked.
+
 ### Docker Desktop must be running
 
 Not just installed — **running**. Look for the whale icon in your

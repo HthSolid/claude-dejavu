@@ -1,5 +1,5 @@
 {
-  "description": "claude-dejavu hooks: setup, session mirror, ingest, snapshot, and pre-edit symbol lint",
+  "description": "claude-dejavu hooks: setup, session mirror, ingest, snapshot, and pre-edit symbol lint. All commands route through bin/dejavu-hook.py so they work on Windows (where `python3` is not the canonical name) without per-OS dispatch logic in this file.",
   "hooks": {
     "Setup": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/install.py\" --auto",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py\" setup",
             "timeout": 600
           }
         ]
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\"",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py\" session-start",
             "timeout": 5
           }
         ]
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.py\"",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py\" stop",
             "timeout": 10
           }
         ]
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_end.py\"",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py\" session-end",
             "timeout": 30
           }
         ]
@@ -55,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py\"",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py\" pre-tool-use",
             "timeout": 5
           }
         ]

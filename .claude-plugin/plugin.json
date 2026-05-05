@@ -1,6 +1,6 @@
 {
   "name": "claude-dejavu",
-  "version": "0.5.0c",
+  "version": "0.5.0d",
   "description": "Memory + recovery + code grounding for Claude Code. Restores deleted sessions, hybrid Postgres+Weaviate recall across every past conversation, tree-sitter symbol indexing across 12 languages, eight identifier-grounding domains (env / DB / route / GraphQL / flag / CSS / i18n / module-export), and a 14-strategy deterministic rewriter that catches fabricated names before they hit disk. Bench: 89.3% reduction in hallucinated identifiers (51.5% → 5.5%, n=400, McNemar p<1e-26). Up to 99% in some v0.5.0a tests (n=200, no stability guarantee yet).",
   "author": {
     "name": "HTE Switzerland"

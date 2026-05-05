@@ -4,6 +4,68 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.5.0d] — 2026-05-05
+
+Cross-platform install fix. **Critical for Windows users.**
+
+### Fixed
+
+- Hook commands in `hooks/hooks.json` previously called `python3
+  SCRIPT.py` directly. On Windows this fails — the canonical
+  command is `python` or `py.exe` and `python3` typically isn't on
+  PATH. As a result, every Windows install of v0.5.0c and earlier
+  silently failed at the **Setup** hook (which calls `install.py`),
+  leaving the plugin "enabled" with no venv, no Postgres / Weaviate
+  provisioning, no MCP server, and no `dejavu_*` tools registered.
+  All subsequent hooks (SessionStart, Stop, SessionEnd, PreToolUse)
+  failed for the same reason.
+
+  Symptom: `/claude-dejavu:dejavu-restore` returns "MCP tool not in
+  registry," doctor reports nothing because the MCP server never
+  started, and `bin/claude-dejavu-mcp` errors with "bundled venv
+  not found." The plugin appears installed but does literally
+  nothing.
+
+### Added
+
+- `bin/dejavu-hook.py` — single cross-platform hook dispatcher.
+  Takes a hook name (`setup` / `session-start` / `stop` /
+  `session-end` / `pre-tool-use`) and re-execs the corresponding
+  handler using `sys.executable` so subsequent calls don't depend
+  on PATH lookup.
+
+### Changed
+
+- `hooks/hooks.json` — every command now routes through
+  `python "${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py" <hook-name>`.
+  The canonical `python` (not `python3`) is the only PATH
+  requirement, matching the existing `.mcp.json` convention.
+
+### Documentation
+
+- `docs/TROUBLESHOOTING.md` — added a Windows-specific section
+  noting that `python` must be on PATH before the Setup hook can
+  fire, with the apt-install one-liner for Ubuntu users
+  (`apt install python-is-python3`) and the Windows installer
+  default behavior.
+
+### Migration for existing Windows installs
+
+If you have an existing v0.5.0c-or-earlier install on Windows that
+never completed Setup, refresh the marketplace clone to v0.5.0d
+and run `install.py` manually:
+
+```powershell
+cd "$env:APPDATA\claude\plugins\marketplaces\claude-dejavu"
+git fetch origin main
+git reset --hard origin/main
+
+python "$env:APPDATA\claude\plugins\marketplaces\claude-dejavu\scripts\install.py"
+```
+
+Then fully restart Claude Code. Future installs will Setup
+correctly without manual intervention.
+
 ## [0.5.0c] — 2026-05-04
 
 Troubleshooting documentation release. Pure docs — no code changes.
@@ -11,26 +73,14 @@ Troubleshooting documentation release. Pure docs — no code changes.
 ### Added
 
 - `docs/TROUBLESHOOTING.md` — comprehensive install + runtime
-  troubleshooting guide, written from a real user's
-  Windows-with-Docker-not-running install journey. Covers:
-
-  - **Quick reference table** mapping every observed error message
-    (e.g. `MCP error -32000: Connection closed`) to its meaning +
-    the exact fix command.
-  - **Install resume flow**: the installer is idempotent — re-running
-    after fixing the underlying issue picks up where it left off.
-  - **Common install failures**: Docker not running, PG / Weaviate
-    startup hangs, port conflicts (auto-handled), CLI shim PATH.
-  - **Runtime issues**: lint not catching fabrications (reindex
-    needed), missing slash commands (`/plugin update` flow),
-    sessions not mirrored, slow reindex.
-  - **Windows-specific notes**: Docker Desktop must be RUNNING (not
-    just installed), WSL2 backend recommended, antivirus exclusion
-    paths, PATH/shim resolution on PowerShell.
-  - **Bug-report template**: the three things we need (command +
-    `dejavu doctor` output + `dejavu logs --with-traceback`).
-  - **Diagnostic command cheat sheet** + nuclear-option full
-    re-install.
+  troubleshooting guide. Maps every observed error message to its
+  fix command. Covers Docker-not-running flow, install resume,
+  PG / Weaviate startup hangs, port conflicts, Windows-specific
+  notes (Docker Desktop must be running, WSL2 backend, antivirus
+  exclusions), runtime issues (lint not catching fabrications,
+  missing slash commands, sessions not mirrored, slow reindex),
+  bug-report template, diagnostic command cheat sheet, and a
+  nuclear-option full re-install for when all else fails.
 
 - README install section now links to the new troubleshooting
   guide so users find it before they get stuck.

@@ -60,6 +60,19 @@ PG_DSN = (f"host={_CFG.get('PG_HOST','localhost')} port={_CFG.get('PG_PORT','545
           f"dbname={_PG_DB}")
 WEAVIATE_URL = _CFG.get("WV_URL", "http://localhost:8888")
 WEAVIATE_CLASS = "ClaudeDejavuTurn"
+
+# Cloud embed mode (DEJAVU_EMBED_MODE=cloud) routes vectorization through
+# the dejavu-cloud managed embedder. When active, every batch upsert
+# computes vectors client-side and sends them with the object payload (the
+# Weaviate class must be recreated with vectorizer:none — see migrate_to_cloud.py).
+_DEJAVU_EMBED_MODE = (os.environ.get("DEJAVU_EMBED_MODE")
+                      or _CFG.get("DEJAVU_EMBED_MODE", "local")).strip().lower()
+# embedding_provider only reads env vars, so propagate config.env values
+# into the env at import time (env wins on conflict — explicit override).
+for _k in ("DEJAVU_EMBED_MODE", "DEJAVU_CLOUD_URL", "DEJAVU_CLOUD_KEY",
+           "DEJAVU_LOCAL_URL"):
+    if _CFG.get(_k) and not os.environ.get(_k):
+        os.environ[_k] = _CFG[_k]
 TOOL_OUTPUT_TRUNC = 8000
 CONTENT_VECTORIZE_MAX = 4000
 CONTENT_VECTORIZE_MIN = 50
@@ -205,7 +218,12 @@ def weaviate_id_for(session_id: str, turn_id: int) -> str:
 
 def weaviate_batch_upsert(items: list[tuple[int, dict]]) -> dict[int, str]:
     """Upsert a batch of items via /v1/batch/objects. Returns {turn_id: weaviate_id}.
-    Uses deterministic UUIDs so re-runs overwrite the same object."""
+    Uses deterministic UUIDs so re-runs overwrite the same object.
+
+    Cloud mode (DEJAVU_EMBED_MODE=cloud) embeds via the dejavu-cloud Worker
+    BEFORE upsert, and sends the vector along with the object. The class
+    must have `vectorizer:none` — run code/migrate_to_cloud.py once.
+    """
     if not items:
         return {}
     objects = []
@@ -214,6 +232,44 @@ def weaviate_batch_upsert(items: list[tuple[int, dict]]) -> dict[int, str]:
         oid = weaviate_id_for(props["session_id"], turn_id)
         out[turn_id] = oid
         objects.append({"class": WEAVIATE_CLASS, "id": oid, "properties": props})
+
+    # ---- CLOUD MODE: client-side vectorization ----
+    if _DEJAVU_EMBED_MODE == "cloud":
+        try:
+            from embedding_provider import get_provider, EmbeddingError  # type: ignore
+        except ImportError as e:
+            print(f"  cloud mode: embedding_provider unavailable: {e}", file=sys.stderr)
+        else:
+            try:
+                prov = get_provider()
+                # We embed on `content` (truncated). Match the local
+                # text2vec-transformers default which would have done the
+                # same field selection per moduleConfig.
+                texts = [(o["properties"].get("content") or "")[:CONTENT_VECTORIZE_MAX]
+                         for o in objects]
+                result = prov.embed(texts)
+                if len(result.vectors) != len(objects):
+                    print(f"  cloud embed length mismatch: "
+                          f"got {len(result.vectors)} for {len(objects)} objects",
+                          file=sys.stderr)
+                else:
+                    for o, v in zip(objects, result.vectors):
+                        o["vector"] = v
+                    print(f"  cloud embed: {len(objects)} texts, {result.tokens} tokens, "
+                          f"{result.cache_hits} cache hits, {result.elapsed_ms}ms",
+                          file=sys.stderr)
+            except EmbeddingError as e:
+                # The objects below will be sent WITHOUT a `vector` field,
+                # which means Weaviate falls back to its CLASS-CONFIGURED
+                # vectorizer. That works only if (a) the class still has
+                # `text2vec-transformers` AND (b) the inference container
+                # is reachable. Cloud-only users (transformers stopped,
+                # class migrated to vectorizer:none) will see this error
+                # propagate as `weaviate batch item N failed: …` below.
+                print(f"  cloud embed failed: {e} — sending without vector "
+                      f"(Weaviate will try its configured vectorizer; will "
+                      f"fail if class=vectorizer:none or container is down)",
+                      file=sys.stderr)
 
     body = json.dumps({"objects": objects}).encode()
     req = urllib.request.Request(f"{WEAVIATE_URL}/v1/batch/objects", data=body, method="POST", headers={"Content-Type": "application/json"})
@@ -885,6 +941,98 @@ def cmd_reingest(conn, session_id=None, missing_only=False, workers: int = 1):
     cmd_bootstrap_from_live(conn)
 
 
+def cmd_retry_vectorize(conn, *, limit: int | None = None,
+                         batch_size: int = 64) -> None:
+    """Re-vectorize turns stuck with vectorized=FALSE.
+
+    Bypasses the cursor-based ingest dedup and just processes all
+    narrative-text turns whose Weaviate insert previously failed
+    (transformers down, network blip, killed mid-batch, etc.).
+    Honors DEJAVU_EMBED_MODE so cloud mode pumps them through the
+    dejavu-cloud Worker rather than the local container.
+
+    Filters mirror the live ingest path: only role in (user,assistant),
+    only content_type=text, only content >= CONTENT_VECTORIZE_MIN chars.
+    """
+    sql = (
+        "SELECT t.id, t.session_id::text, t.idx, s.project_slug, "
+        "       t.role, t.content, t.ts, t.model, s.ai_title "
+        "FROM turns t JOIN sessions s ON s.id = t.session_id "
+        "WHERE NOT t.vectorized "
+        "  AND t.role IN ('user','assistant') "
+        "  AND t.content_type = 'text' "
+        "  AND length(t.content) >= %s "
+        "ORDER BY t.id"
+    )
+    params: list = [CONTENT_VECTORIZE_MIN]
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    print(f"[retry-vectorize] {len(rows)} eligible turn(s); "
+          f"mode={_DEJAVU_EMBED_MODE}, batch_size={batch_size}")
+    if not rows:
+        return
+
+    started = time.time()
+    items: list[tuple[int, dict]] = []
+    succeeded_total = 0
+    seen_total = 0
+    last_progress = 0
+
+    def flush() -> None:
+        nonlocal succeeded_total
+        if not items:
+            return
+        ok = weaviate_batch_upsert(items)
+        if ok:
+            with conn.cursor() as cur2:
+                psycopg2.extras.execute_values(
+                    cur2,
+                    "UPDATE turns AS t SET vectorized=TRUE, "
+                    "weaviate_id=v.wid::uuid FROM (VALUES %s) AS v(tid, wid) "
+                    "WHERE t.id = v.tid",
+                    [(tid, wid) for tid, wid in ok.items()],
+                )
+            conn.commit()
+            succeeded_total += len(ok)
+        items.clear()
+
+    try:
+        for tid, sid, idx, slug, role, content, ts, model, ai_title in rows:
+            snippet = (content or "")[:CONTENT_VECTORIZE_MAX]
+            items.append((tid, {
+                "session_id": sid,
+                "turn_id": idx,
+                "project_slug": slug or "",
+                "role": role,
+                "content": snippet,
+                "ts": ts.isoformat() if ts else None,
+                "model": model or "",
+                "ai_title": ai_title or "",
+            }))
+            seen_total += 1
+            if len(items) >= batch_size:
+                flush()
+            if seen_total - last_progress >= 200:
+                elapsed = max(0.001, time.time() - started)
+                rate = succeeded_total / elapsed
+                print(f"[retry-vectorize] {succeeded_total}/{seen_total} ok "
+                      f"({rate:.1f}/s, eta "
+                      f"{(len(rows) - seen_total) / max(rate, 0.1):.0f}s)")
+                last_progress = seen_total
+        flush()
+    finally:
+        elapsed = time.time() - started
+        print(f"[retry-vectorize] done in {elapsed:.1f}s — "
+              f"{succeeded_total}/{seen_total} succeeded "
+              f"(failed: {seen_total - succeeded_total})")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--backfill", action="store_true",
@@ -911,6 +1059,11 @@ if __name__ == "__main__":
     p.add_argument("--session")
     p.add_argument("--jsonl")
     p.add_argument("--project")
+    p.add_argument("--retry-vectorize", action="store_true",
+                   help="re-process turns where vectorized=FALSE — uses "
+                        "DEJAVU_EMBED_MODE to decide local vs cloud")
+    p.add_argument("--limit", type=int, default=None,
+                   help="cap items processed (with --retry-vectorize)")
     args = p.parse_args()
 
     # Top-level try/except — if anything below leaks an uncaught
@@ -920,7 +1073,9 @@ if __name__ == "__main__":
     conn = None
     try:
         conn = psycopg2.connect(PG_DSN)
-        if args.reingest:
+        if args.retry_vectorize:
+            cmd_retry_vectorize(conn, limit=args.limit)
+        elif args.reingest:
             cmd_reingest(conn,
                          session_id=args.session,
                          missing_only=args.missing_only,

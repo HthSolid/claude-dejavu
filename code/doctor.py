@@ -19,6 +19,8 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -300,9 +302,20 @@ def _check_weaviate(cfg: dict, rep: Report) -> bool:
     # recreated their Weaviate container, ending up with a working
     # Weaviate but no `ClaudeDejavuTurn` class. Searches would
     # silently return zero hits forever.
+    cname = "?"  # default for the error-path message
     try:
         from health import (check_weaviate_class,
                                 expected_weaviate_class)
+    except ImportError as e:
+        # `health` not on path — treat as "can't verify" rather than
+        # "class missing", since the class might be perfectly fine.
+        rep.add(CheckResult(
+            "weaviate", "skip",
+            detail=(f"v{ver} at {url}, class verification skipped "
+                    f"(health module unavailable: {e})"),
+        ))
+        return True  # Weaviate itself is up, that's all we proved
+    try:
         cname = expected_weaviate_class()
         wv_status = check_weaviate_class(url, cname)
     except Exception as e:  # noqa: BLE001
@@ -421,6 +434,106 @@ def _check_perf_class(cfg: dict, rep: Report) -> None:
             "claude-dejavu Pro (managed cloud gists, sub-100ms, "
             "no key setup required) when v0.6 ships."
         ),
+    ))
+
+
+def _check_cloud_embed(cfg: dict, rep: Report) -> None:
+    """Check cloud embedding mode health.
+
+    Surfaces 4 states:
+      - skip  : DEJAVU_EMBED_MODE != "cloud" (user is on local mode)
+      - warn  : cloud mode set but DEJAVU_CLOUD_KEY missing
+      - fail  : worker unreachable / key invalid / quota exhausted
+      - ok    : worker reachable, key valid, embed path returns 1024-dim vectors
+    """
+    mode = (os.environ.get("DEJAVU_EMBED_MODE")
+            or cfg.get("DEJAVU_EMBED_MODE", "local")).strip().lower()
+    if mode != "cloud":
+        rep.add(CheckResult(
+            "cloud_embed", "skip",
+            detail="local mode (set DEJAVU_EMBED_MODE=cloud + DEJAVU_CLOUD_KEY to enable)",
+        ))
+        return
+
+    key = (os.environ.get("DEJAVU_CLOUD_KEY") or cfg.get("DEJAVU_CLOUD_KEY", "")).strip()
+    url = (os.environ.get("DEJAVU_CLOUD_URL")
+           or cfg.get("DEJAVU_CLOUD_URL", "https://embed.hte.digital")).rstrip("/")
+
+    if not key:
+        rep.add(CheckResult(
+            "cloud_embed", "warn",
+            detail=f"cloud mode active but DEJAVU_CLOUD_KEY is empty",
+            fix="set DEJAVU_CLOUD_KEY to a dvk_live_… Pro key (run `dejavu login`)",
+        ))
+        return
+
+    # Liveness ping
+    try:
+        with urllib.request.urlopen(f"{url}/v1/ping", timeout=5) as r:
+            ping = json.loads(r.read())
+    except Exception as e:  # noqa: BLE001
+        rep.add(CheckResult(
+            "cloud_embed", "fail",
+            detail=f"cloud worker unreachable at {url}: {type(e).__name__}: {e}",
+        ))
+        return
+
+    # Auth + quota check via /v1/whoami — costs ZERO cloud tokens.
+    # (Earlier versions called /v1/embed which consumed ~10 tokens per
+    # doctor run; that surprised users on tight quotas. Whoami is free
+    # and surfaces the same auth/quota signals.)
+    req = urllib.request.Request(
+        f"{url}/v1/whoami", method="GET",
+        headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body_txt = e.read()[:200].decode(errors="replace")
+        if e.code == 401:
+            rep.add(CheckResult(
+                "cloud_embed", "fail",
+                detail=f"key rejected (401): {body_txt}",
+                fix="run `dejavu logout && dejavu login` to refresh the key",
+            ))
+        elif e.code == 402:
+            rep.add(CheckResult(
+                "cloud_embed", "fail",
+                detail=f"monthly quota exhausted (402): {body_txt}",
+                fix="upgrade plan or wait until next month bucket",
+            ))
+        elif e.code == 429:
+            rep.add(CheckResult(
+                "cloud_embed", "warn",
+                detail=f"rate-limited (429): {body_txt} (transient)",
+            ))
+        else:
+            rep.add(CheckResult(
+                "cloud_embed", "fail",
+                detail=f"whoami HTTP {e.code}: {body_txt}",
+            ))
+        return
+    except Exception as e:  # noqa: BLE001
+        rep.add(CheckResult(
+            "cloud_embed", "fail",
+            detail=f"whoami error: {type(e).__name__}: {e}",
+        ))
+        return
+
+    cap = data.get("monthly_cap", 0)
+    used = data.get("quota_used", 0)
+    remaining = data.get("quota_remaining", 0)
+    pct = (used / cap * 100) if cap else 0
+    status = "ok"
+    if pct > 90:
+        status = "warn"
+    rep.add(CheckResult(
+        "cloud_embed", status,
+        detail=(f"cloud at {url} ({ping.get('version', '?')}) ok — "
+                f"tier={data.get('tier')} prefix={data.get('prefix')} "
+                f"used={used}/{cap} ({pct:.1f}%) remaining={remaining}"),
+        fix=("approaching cap — consider upgrading or wait for next month"
+             if pct > 90 else None),
     ))
 
 
@@ -620,6 +733,7 @@ def run_doctor(verbose: bool = False) -> Report:
     _check_symbol_index(cfg, rep)
     _check_ingest_coverage(cfg, rep)
     _check_perf_class(cfg, rep)
+    _check_cloud_embed(cfg, rep)
     _check_hooks_wiring(rep)
     _check_error_log(rep)
     return rep

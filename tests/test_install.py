@@ -126,6 +126,35 @@ def test_install_py_uses_p_flag_in_compose_calls() -> None:
          f"got {n_p_flag} -p flags vs {n_compose} compose calls")
 
 
+def test_reclaim_stale_named_containers_safe_no_docker() -> None:
+    _step("_reclaim_stale_named_containers no-op when docker missing")
+    install = _import_install()
+    import unittest.mock as mock_
+    with mock_.patch("shutil.which") as m:
+        m.return_value = None
+        r = install._reclaim_stale_named_containers()
+    _aT("checked is empty (no docker)", r["checked"] == [])
+    _aT("reclaimed is empty", r["reclaimed"] == [])
+    _aT("errors is empty", r["errors"] == [])
+
+
+def test_reclaim_stale_named_containers_skips_owned() -> None:
+    _step("_reclaim_stale_named_containers leaves our own "
+            "containers alone")
+    install = _import_install()
+    import unittest.mock as mock_
+    cp_inspect = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="claude-dejavu\n", stderr="")
+    with mock_.patch("shutil.which", return_value="/usr/bin/docker"), \
+            mock_.patch("subprocess.run", return_value=cp_inspect):
+        r = install._reclaim_stale_named_containers()
+    _aT("nothing reclaimed (all owned by us)",
+         r["reclaimed"] == [])
+    _aT("no errors", r["errors"] == [])
+    _aT("checked all 3 canonical names",
+         len(r["checked"]) == 3, f"got {r['checked']}")
+
+
 def test_dejavu_hook_resolves_venv_python() -> None:
     _step("dejavu-hook resolves venv python for non-Setup hooks")
     spec = importlib.util.spec_from_file_location(
@@ -188,6 +217,8 @@ def main() -> int:
         test_normalize_mcp_json_skipped_in_git_clone,
         test_docker_compose_uses_project_name,
         test_install_py_uses_p_flag_in_compose_calls,
+        test_reclaim_stale_named_containers_safe_no_docker,
+        test_reclaim_stale_named_containers_skips_owned,
         test_dejavu_hook_resolves_venv_python,
         test_doctor_utf8_reconfigure_present,
         test_install_py_utf8_reconfigure_present,

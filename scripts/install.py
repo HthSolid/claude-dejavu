@@ -289,9 +289,16 @@ def probe_pg(host: str, port: int, timeout: float = 2.0,
     SearXNG colonized port 8889 and a Weaviate-shaped check accepted it.
 
     Verification ladder:
-      1. pg_isready (best — speaks the Postgres startup protocol)
-      2. psql -c 'SELECT 1' against the default `postgres` db
-      3. Refuse to declare success on TCP-only.
+      1. pg_isready on host PATH (best — speaks the Postgres
+         startup protocol).
+      2. psql -c 'SELECT 1' on host PATH against the default
+         `postgres` db.
+      3. `docker exec claude-dejavu-postgres pg_isready` — Windows
+         users almost never have host pg_isready/psql, but if our
+         bundled container is up they're inside it. Without this
+         path the install on Windows would 60s-timeout despite the
+         container being healthy.
+      4. Refuse to declare success on TCP-only.
     """
     pg_isready = shutil.which("pg_isready")
     if pg_isready:
@@ -316,6 +323,28 @@ def probe_pg(host: str, port: int, timeout: float = 2.0,
         if r.returncode == 0 and (r.stdout or "").strip() == "1":
             return True, "psql"
         return False, f"psql_failed: {(r.stderr or '').strip()[:120]}"
+
+    # No host-side tools. If the bundled Postgres container is up,
+    # pg_isready lives INSIDE it — usable via docker exec. This is
+    # the Windows-without-postgres-client path that the v0.5.0d-and-
+    # earlier installer would silently 60s-timeout on.
+    if shutil.which("docker"):
+        r = subprocess.run(
+            ["docker", "exec", "claude-dejavu-postgres",
+              "pg_isready", "-U", user, "-d", "postgres",
+              "-t", str(int(timeout))],
+            capture_output=True, text=True,
+            timeout=max(int(timeout) + 2, 5),
+        )
+        if r.returncode == 0:
+            return True, "docker_exec_pg_isready"
+        # If docker exec succeeded but pg_isready returned non-zero,
+        # the container exists but PG isn't ready yet.
+        if "Error response from daemon" in (r.stderr or ""):
+            # Container doesn't exist — distinct from "PG not ready"
+            return False, "container_not_found"
+        return False, ("docker_exec_pg_isready_not_ready: "
+                          + (r.stdout or r.stderr).strip()[:120])
 
     # No way to confirm — refuse to claim success. TCP-only is misleading.
     return False, "no_pg_isready_or_psql_available_for_verification"
@@ -356,6 +385,75 @@ def probe_weaviate(url: str, timeout: float = 3.0) -> dict | None:
     if not ver or not ver[0].isdigit():
         return None
     return data
+
+
+def _reclaim_stale_named_containers() -> dict[str, Any]:
+    """Free up our canonical container names if they're held by a
+    container belonging to a different (or unlabeled) Compose
+    project.
+
+    Why this is necessary: docker container names are global, not
+    project-scoped. If a previous install ran with a different
+    Compose project name (e.g. v0.5.0d-and-earlier derived the name
+    from the parent dir `docker/` and ended up using that as
+    the project), the resulting `claude-dejavu-postgres` /
+    `claude-dejavu-weaviate` / `claude-dejavu-transformers`
+    containers are still squatting on the names. Compose v2 will
+    refuse to create our pinned-project containers because:
+
+        Error: Conflict. The container name "claude-dejavu-postgres"
+        is already in use by container "abc123…"
+
+    We safely remove (NOT prune) such stale containers. Volumes —
+    which is where the actual data lives — are NOT touched, so
+    repeated runs preserve session data across the migration.
+
+    Returns: {
+        "checked": [container_name, ...],
+        "reclaimed": [{"name", "from_project"}],
+        "errors": [str, ...],
+    }
+    """
+    from typing import Any  # noqa: F401  (already imported earlier)
+    out: dict[str, Any] = {"checked": [], "reclaimed": [], "errors": []}
+    if not shutil.which("docker"):
+        return out
+
+    canonical = ["claude-dejavu-postgres",
+                   "claude-dejavu-weaviate",
+                   "claude-dejavu-transformers"]
+    for name in canonical:
+        out["checked"].append(name)
+        # Check if a container with this name exists at all.
+        r = subprocess.run(
+            ["docker", "inspect", "--format",
+              "{{ index .Config.Labels \"com.docker.compose.project\" }}",
+              name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            # No container with that name — nothing to reclaim.
+            continue
+        existing_project = (r.stdout or "").strip()
+        if existing_project == "claude-dejavu":
+            # Already ours — Compose will reuse it cleanly.
+            continue
+        # Stale: belongs to another project (or unlabeled). Remove.
+        cyan(f"    Reclaiming stale container `{name}` "
+                f"(was in project `{existing_project or '<none>'}`). "
+                f"Volume data preserved.")
+        # Stop + remove. -f forces removal even if running.
+        rm = subprocess.run(["docker", "rm", "-f", name],
+                                capture_output=True, text=True,
+                                timeout=20)
+        if rm.returncode != 0:
+            err = (rm.stderr or rm.stdout).strip()[:200]
+            out["errors"].append(f"{name}: {err}")
+            yellow(f"    ⚠ couldn't remove `{name}`: {err}")
+            continue
+        out["reclaimed"].append({"name": name,
+                                      "from_project": existing_project})
+    return out
 
 
 # ─── Step 1: data root ───────────────────────────────────────────────────────
@@ -417,16 +515,69 @@ def step_postgres(args, data_dir: Path) -> dict:
             # + wasted resources, and could be confusing).
             services_to_start = ["postgres"]  # always — we got here
                                                  # because PG was missing
-            existing_wv = probe_weaviate("http://localhost:8080") \
-                            or probe_weaviate("http://localhost:8889")
-            if existing_wv:
+            # Per-port probe so we can log the actual URL we found
+            # (was previously logging the raw meta dict, which is
+            # noisy and unhelpful). Also verify the existing Weaviate
+            # has the `text2vec-transformers` module — without it
+            # our class can't be created (it depends on that
+            # vectorizer). If module missing, we DO spin up the
+            # bundled stack so we have a Weaviate that can satisfy
+            # our schema requirements.
+            existing_wv_url = None
+            existing_wv_meta = None
+            for _try_url in ("http://localhost:8080",
+                                "http://localhost:8889"):
+                _meta = probe_weaviate(_try_url)
+                if _meta:
+                    existing_wv_url = _try_url
+                    existing_wv_meta = _meta
+                    break
+            wv_modules = (existing_wv_meta or {}).get("modules", {}) \
+                            if isinstance(existing_wv_meta, dict) else {}
+            has_t2v = "text2vec-transformers" in (wv_modules or {})
+            if existing_wv_url and has_t2v:
                 green(f"    ✓ Detected existing Weaviate at "
-                        f"{existing_wv} — will reuse, NOT spinning up "
-                        f"a bundled copy.")
+                        f"{existing_wv_url} (v"
+                        f"{existing_wv_meta.get('version', '?')}) "
+                        f"with text2vec-transformers — will reuse.")
+            elif existing_wv_url and not has_t2v:
+                yellow(f"    ⚠ Found Weaviate at {existing_wv_url} "
+                          f"but it lacks the text2vec-transformers "
+                          f"module — bundled stack will be brought up "
+                          f"separately so our class can be created.")
+                services_to_start += ["weaviate", "transformers"]
             else:
                 services_to_start += ["weaviate", "transformers"]
                 yellow("    No Weaviate detected — will bring up the "
                           "bundled stack (weaviate + transformers).")
+
+            # Reclaim any stale containers from prior installs
+            # whose project name didn't match our pinned
+            # `claude-dejavu`. Without this, Compose fails with
+            # "container name X is already in use" on every retry.
+            reclaim_report = _reclaim_stale_named_containers()
+            if reclaim_report["reclaimed"]:
+                names = ", ".join(r["name"] for r
+                                       in reclaim_report["reclaimed"])
+                green(f"    ✓ Reclaimed stale containers: {names} "
+                        f"(volumes preserved)")
+            if reclaim_report["errors"]:
+                _fail(args, "stale_container_reclaim_failed",
+                        "Could not reclaim stale container name(s) "
+                        "from a previous install",
+                        "\n".join([
+                            "Errors:",
+                            *("  " + e for e in reclaim_report["errors"]),
+                            "",
+                            "Manual fix:",
+                            "  docker rm -f claude-dejavu-postgres "
+                              "claude-dejavu-weaviate "
+                              "claude-dejavu-transformers",
+                            "Then re-run: python scripts/install.py "
+                              "--auto",
+                            "Volumes are NOT touched by `docker rm` — "
+                            "your session data is safe.",
+                        ]))
 
             cyan(f"    Spinning up: {', '.join(services_to_start)} "
                     f"via docker-compose…")
@@ -685,6 +836,25 @@ def step_weaviate(args, data_dir: Path) -> dict:
                 _fail(args, "docker_missing",
                         "Docker not found in PATH",
                         _docker_install_instructions())
+            # Same stale-container reclaim as in step_postgres.
+            # We're only ever bringing up weaviate + transformers
+            # here (postgres path took a different branch above),
+            # but the function is cheap to call and idempotent.
+            reclaim_report = _reclaim_stale_named_containers()
+            if reclaim_report["reclaimed"]:
+                names = ", ".join(r["name"] for r
+                                       in reclaim_report["reclaimed"])
+                green(f"    ✓ Reclaimed stale containers: {names} "
+                        f"(volumes preserved)")
+            if reclaim_report["errors"]:
+                _fail(args, "stale_container_reclaim_failed",
+                        "Could not reclaim stale container name(s)",
+                        "Manual fix:\n  docker rm -f "
+                        "claude-dejavu-weaviate "
+                        "claude-dejavu-transformers\n"
+                        "Then re-run install.py --auto. Volumes are "
+                        "NOT touched by docker rm — data is safe.")
+
             # docker-compose.minimal.yml brings up weaviate + transformers along with postgres
             compose_file = PLUGIN_ROOT / "docker" / "docker-compose.minimal.yml"
             cyan("    Bringing up Weaviate + transformers via "
@@ -852,6 +1022,10 @@ def step_config(args, data_dir: Path, pg: dict, wv: dict, venv: Path):
     lines.append(f"OS_USER={OS_USER}")
     lines.append(f"SHARED={int(bool(args.shared))}")
     lines.append("CLAUDE_DEJAVU_DEFAULT_SCOPE=workspace")
+    # Cloud embed tier (v0.6.0+). Defaults to local — no behavior change.
+    # Users opt in via `claude-dejavu login` (writes mode=cloud + key).
+    lines.append("DEJAVU_EMBED_MODE=local")
+    lines.append("DEJAVU_CLOUD_URL=https://embed.hte.digital")
     config.write_text("\n".join(lines) + "\n")
     green(f"  ✓ {config}")
 
@@ -887,16 +1061,34 @@ def step_config(args, data_dir: Path, pg: dict, wv: dict, venv: Path):
 
     if OS_NAME == "Windows":
         cli_path = bin_dir / "claude-dejavu.bat"
+        # Windows wrapper: prefer venv python, fall back to system
+        # python for read-only `doctor` so the user can see what's
+        # broken even when the venv itself is missing.
         cli_path.write_text(
             f'@echo off\r\n'
-            f'"{venv / "Scripts" / "python.exe"}" '
-            f'"{PLUGIN_ROOT / "code" / "recall.py"}" %*\r\n'
+            f'set "VENV_PY={venv / "Scripts" / "python.exe"}"\r\n'
+            f'if exist "%VENV_PY%" (\r\n'
+            f'  "%VENV_PY%" "{PLUGIN_ROOT / "code" / "recall.py"}" %*\r\n'
+            f'  exit /b %errorlevel%\r\n'
+            f')\r\n'
+            f'if /i "%~1"=="doctor" (\r\n'
+            f'  for %%P in (python py python3) do (\r\n'
+            f'    where %%P >nul 2>nul && (\r\n'
+            f'      echo claude-dejavu: venv missing - running doctor via %%P 1^>^&2\r\n'
+            f'      %%P "{PLUGIN_ROOT / "code" / "doctor.py"}" %2 %3 %4 %5 %6 %7 %8 %9\r\n'
+            f'      exit /b %errorlevel%\r\n'
+            f'    )\r\n'
+            f'  )\r\n'
+            f')\r\n'
+            f'echo claude-dejavu: venv python missing at %VENV_PY% 1^>^&2\r\n'
+            f'echo   Re-run: python scripts\\install.py --auto 1^>^&2\r\n'
+            f'exit /b 1\r\n'
         )
     else:
         cli_path = bin_dir / "claude-dejavu"
-        # Generate a wrapper that prefers python3 but falls back to
-        # python — handles edge-case venvs that only symlink one or
-        # the other (rare but real on stripped Linux installs).
+        # POSIX wrapper: prefer python3 venv, fall back to python
+        # venv, then for `doctor` fall back to system python so the
+        # user can see what's broken even with no venv.
         cli_path.write_text(
             f'#!/bin/bash\n'
             f'if [ -x "{venv / "bin" / "python3"}" ]; then\n'
@@ -905,11 +1097,22 @@ def step_config(args, data_dir: Path, pg: dict, wv: dict, venv: Path):
             f'elif [ -x "{venv / "bin" / "python"}" ]; then\n'
             f'  exec "{venv / "bin" / "python"}" '
             f'"{PLUGIN_ROOT / "code" / "recall.py"}" "$@"\n'
-            f'else\n'
-            f'  echo "claude-dejavu: venv python not found — '
-            f're-run install.py" >&2\n'
-            f'  exit 1\n'
             f'fi\n'
+            f'# venv missing — let `doctor` run via system python so the '
+            f'user gets actionable diagnostic output instead of a hard exit.\n'
+            f'if [ "${{1:-}}" = "doctor" ]; then\n'
+            f'  for sys_py in python3 python py; do\n'
+            f'    if command -v "$sys_py" >/dev/null 2>&1; then\n'
+            f'      echo "claude-dejavu: venv missing — running '
+            f'doctor via $sys_py" >&2\n'
+            f'      exec "$sys_py" '
+            f'"{PLUGIN_ROOT / "code" / "doctor.py"}" "${{@:2}}"\n'
+            f'    fi\n'
+            f'  done\n'
+            f'fi\n'
+            f'echo "claude-dejavu: venv python missing — '
+            f're-run install.py" >&2\n'
+            f'exit 1\n'
         )
         cli_path.chmod(0o755)
     green(f"  ✓ CLI: {cli_path}")

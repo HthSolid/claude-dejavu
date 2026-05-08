@@ -1780,6 +1780,58 @@ def main():
     sd = sw.add_parser("delete"); sd.add_argument("name")
     s.set_defaults(func=cmd_workspace)
 
+    # cloud subcommands: login / logout / status
+    from cloud_cli import cmd_login, cmd_logout, cmd_status
+
+    sl = sub.add_parser("login",
+                        help="sign in to claude-dejavu cloud (Pro tier)")
+    sl.add_argument("--paste", action="store_true",
+                    help="skip browser flow; paste a key directly")
+    sl.add_argument("--license-url",
+                    help="override license server URL (default: "
+                         "https://license.hte.digital)")
+    sl.set_defaults(func=lambda a: sys.exit(cmd_login(a)))
+
+    sl = sub.add_parser("logout",
+                        help="sign out — revoke server-side + erase local key")
+    sl.add_argument("--license-url",
+                    help="override license server URL")
+    sl.add_argument("--skip-revoke", action="store_true",
+                    help="erase local key only; don't ask server to revoke")
+    sl.set_defaults(func=lambda a: sys.exit(cmd_logout(a)))
+
+    sl = sub.add_parser("status",
+                        help="show cloud-tier status (mode, key, quota)")
+    sl.add_argument("--cloud", action="store_true",
+                    help="(default already shows cloud info; reserved for future "
+                         "subsections)")
+    sl.set_defaults(func=lambda a: sys.exit(cmd_status(a)))
+
+    # Cloud migration: drops + recreates Weaviate ClaudeDejavuTurn class with
+    # vectorizer:none, preserving all existing 1024-dim vectors. One-shot;
+    # idempotent (skips if already migrated).
+    sl = sub.add_parser("migrate-to-cloud",
+                        help="migrate Weaviate Turn class to vectorizer:none "
+                             "(needed when fully switching to cloud mode and "
+                             "stopping the local transformers container)")
+    sl.add_argument("--wv-url", default="http://localhost:8888",
+                    help="Weaviate URL (default: http://localhost:8888)")
+    sl.add_argument("--apply", action="store_true",
+                    help="actually execute (default is dry-run)")
+    sl.add_argument("--limit", type=int, default=None,
+                    help="cap re-insert (for testing on a subset)")
+    def _run_migrate(a):
+        import subprocess
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        cmd = [sys.executable, os.path.join(plugin_dir, "migrate_to_cloud.py"),
+               "--wv-url", a.wv_url]
+        if a.apply:
+            cmd.append("--apply")
+        if a.limit is not None:
+            cmd.extend(["--limit", str(a.limit)])
+        sys.exit(subprocess.call(cmd))
+    sl.set_defaults(func=_run_migrate)
+
     args = p.parse_args()
     args.func(args)
 

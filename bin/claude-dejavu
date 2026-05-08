@@ -11,14 +11,46 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_ROOT="${CLAUDE_DEJAVU_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-dejavu}"
 VENV="$DATA_ROOT/venv"
 
+# Resolve the venv interpreter if it exists.
 if [ -x "$VENV/bin/python3" ]; then
   PYBIN="$VENV/bin/python3"
 elif [ -x "$VENV/bin/python" ]; then
   PYBIN="$VENV/bin/python"
 else
+  PYBIN=""
+fi
+
+# Read-only diagnostic subcommands (doctor, logs) work without the
+# venv — they only need stdlib. If the venv is missing AND the user
+# is asking for one of those, fall back to the system python so they
+# can still see what's wrong with the install. Without this fallback
+# the wrapper would die with "venv missing" and the user would have
+# no diagnostic information.
+if [ -z "$PYBIN" ]; then
+  # `doctor` works without the venv — code/doctor.py has only stdlib
+  # imports at module top, and per-check psycopg2/etc. imports are
+  # wrapped so missing deps just produce a `skip` row. That's
+  # exactly what the user needs when the venv itself is the
+  # problem: a diagnostic that can run anyway and tells them.
+  if [ "${1:-}" = "doctor" ]; then
+    for sys_py in python3 python py; do
+      if command -v "$sys_py" >/dev/null 2>&1; then
+        echo "claude-dejavu: venv missing — running 'doctor' via $sys_py" >&2
+        echo "  (deps-requiring checks will skip; venv check will fail" >&2
+        echo "   loud — that's the actual problem to fix)" >&2
+        echo "" >&2
+        exec "$sys_py" "$SCRIPT_DIR/code/doctor.py" "${@:2}"
+      fi
+    done
+  fi
   echo "claude-dejavu: venv missing at $VENV" >&2
   echo "  Run: python scripts/install.py --auto" >&2
   echo "  Or:  python3 scripts/install.py --auto" >&2
+  if [ -f "$DATA_ROOT/INSTALL_STATUS" ]; then
+    echo "" >&2
+    echo "  INSTALL_STATUS marker (last install attempt's state):" >&2
+    sed 's/^/    /' "$DATA_ROOT/INSTALL_STATUS" >&2
+  fi
   exit 1
 fi
 

@@ -4,6 +4,100 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.6.0] — 2026-05-06
+
+**Cloud embedding tier shipped.** New optional path that routes session
+embeddings through a managed cloud embedder instead of
+the local CPU container, eliminating multi-thousand-percent CPU spikes
+on slow machines during reingest. Same model
+(`intfloat/multilingual-e5-large-instruct`), so existing local vectors
+are byte-for-byte interchangeable — no re-embedding required when
+opting in.
+
+### Added
+
+- **`code/embedding_provider.py`** — pluggable embedding interface with
+  three modes selected via `DEJAVU_EMBED_MODE`:
+    - `local` (default) — current behavior, calls the t2v-transformers container
+    - `cloud` — pure cloud, fails fast if the worker is unreachable
+    - `cascade` — cloud primary with optional local fallback (only
+      added if local probes reachable, so we never silently corrupt the
+      index when the local container is intentionally stopped)
+- **`code/cloud_cli.py`** — three new CLI subcommands powering the
+  Pro tier onboarding flow:
+    - `claude-dejavu login`         — OAuth-style browser flow
+    - `claude-dejavu login --paste` — manual paste fallback
+    - `claude-dejavu logout`        — server-side revoke + local erase
+    - `claude-dejavu status`        — mode + worker + adaptive batch + quota
+- **`--retry-vectorize` flag** on `ingester.py` — re-process turns
+  stuck with `vectorized=FALSE`. Bypasses cursor dedup; honors
+  `DEJAVU_EMBED_MODE` so cloud users push through the worker.
+- **`code/migrate_to_cloud.py`** — one-shot Weaviate class migration to
+  `vectorizer:none`, preserving 1024-dim vectors byte-for-byte. --dry-run
+  by default; --apply to execute.
+- **doctor `cloud_embed` check** — surfaces skip / warn / fail / ok with
+  worker version, dim, cache hit ratio, quota remaining.
+
+### Fixed
+
+- `_check_weaviate` UnboundLocalError when the `health` import fails.
+  ImportError now produces a `skip` status (not a misleading `fail`
+  saying "class missing").
+- The cascade provider's error chain now surfaces the cloud-side
+  error too, not just the local fallback's "container not running"
+  message — much faster debugging when the cloud worker is the actual
+  failure point.
+
+### Fixed — Windows install reliability
+
+- **`probe_pg` falls back to `docker exec claude-dejavu-postgres
+  pg_isready`** when host `pg_isready`/`psql` aren't on PATH. Most
+  Windows users don't have the Postgres client installed locally;
+  pre-fix the install would silently 60s-timeout in the readiness
+  loop reporting
+  `no_pg_isready_or_psql_available_for_verification` even though the
+  container was actually up. Now the probe asks the container
+  directly via `docker exec`, which works on every platform.
+- **`_reclaim_stale_named_containers`** runs before `docker compose
+  up` to free our canonical container names if a previous (broken)
+  install left them owned by a different Compose project. Without
+  this, `compose up` errored with
+  `Conflict. The container name "claude-dejavu-postgres" is already
+  in use by container "abc…"` on every retry. Removes the stale
+  container wrapper only — volumes (where the data lives) are
+  preserved, so a subsequent `compose up` re-attaches with no data
+  loss.
+- **Existing-Weaviate detection logs the URL, not the raw meta
+  dict** (was printing `{grpcMaxMessageSize: …, hostname: …, …}`).
+  Also now verifies the existing Weaviate has the
+  `text2vec-transformers` module — if it's a vanilla Weaviate
+  without the vectorizer (common when users have an unrelated
+  Weaviate from another project), the bundled stack is brought up
+  instead so the `ClaudeDejavuTurn` class can actually be created.
+- **`claude-dejavu doctor` now works when the venv is missing.**
+  Previously the wrapper hard-exited with "venv missing — run
+  install.py", giving the user no diagnostic. The wrapper (POSIX
+  + Windows .bat) now falls back to system `python` / `py` for
+  `doctor` specifically — `code/doctor.py` is stdlib-only at
+  module top, and dep-requiring checks already produce `skip`
+  rows. The user gets a real layered report telling them exactly
+  what's broken (venv = fail, all downstream = skip) instead of
+  a one-line "venv missing" stub. POSIX wrapper also dumps the
+  `INSTALL_STATUS` marker contents on hard-fail so the user sees
+  what the last install attempt failed on.
+
+### Privacy
+
+Cloud mode routes embedding requests through a managed gateway to a
+third-party inference provider. The provider does not log content by
+default and never trains on customer data; their TOS reserves the
+right to briefly log content for debugging. The plugin shows the
+provider name + this disclosure on first cloud activation so users
+can decide whether to opt in.
+
+For users staying on local mode: nothing changes. The CPU container
+path is the default and remains fully supported.
+
 ## [0.5.0e] — 2026-05-05
 
 Reliability + observability overhaul. **Closes the silent-ingest-failure

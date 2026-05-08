@@ -177,6 +177,11 @@ def _run_psql(host: str, port: str, user: str, password: str,
     the bundled container, transparently. Hides the Windows-doesn't-
     have-psql issue from callers."""
     env = {**os.environ, "PGPASSWORD": password}
+    # Force UTF-8 for stdin/stdout/stderr. Without this, Python falls
+    # back to the locale codec — cp1252 on Windows — which raises
+    # UnicodeEncodeError the moment the schema (or psql output) hits
+    # a non-ASCII char (em-dash, box-drawing, etc.). schema.sql
+    # contains plenty of those.
     host_psql = shutil.which("psql")
     if host_psql:
         cmd = [host_psql, "-h", host, "-p", str(port), "-U", user]
@@ -186,7 +191,8 @@ def _run_psql(host: str, port: str, user: str, password: str,
             cmd += ["-f", str(input_file)]
         cmd += args_list
         return subprocess.run(cmd, env=env, capture_output=True,
-                                  text=True)
+                                  text=True, encoding="utf-8",
+                                  errors="replace")
     if _USE_BUNDLED_PG_PSQL:
         cmd = ["docker", "exec", "-i",
                  "-e", f"PGPASSWORD={password}",
@@ -199,8 +205,10 @@ def _run_psql(host: str, port: str, user: str, password: str,
         if input_file:
             return subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 input=Path(input_file).read_text(encoding="utf-8"))
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
     # Last-ditch: caller's args_list might still work with raw shell
     # if neither host psql nor docker is available — but practically
     # we can't do anything. Return a fake completed process so the
@@ -337,6 +345,26 @@ def probe_pg(host: str, port: int, timeout: float = 2.0,
             timeout=max(int(timeout) + 2, 5),
         )
         if r.returncode == 0:
+            # PG is up inside the container. But the caller asked us
+            # to verify a specific host port — `docker exec` bypasses
+            # host networking entirely (it goes straight at the
+            # container's loopback), so it tells us NOTHING about
+            # whether `host:port` is reachable from the host. Look up
+            # the container's actual published port mapping; only
+            # claim success when it matches what was probed.
+            mapped = _get_container_pg_host_port()
+            if mapped is None:
+                # PG inside the container, but no host port published.
+                # Runtime clients (psycopg2 from venv) won't reach
+                # it via host networking. Refuse so step_postgres
+                # falls into the auto-provision branch (which
+                # publishes the port via compose).
+                return False, "docker_exec_ok_but_no_host_port_published"
+            if mapped != port:
+                # Container is published on a different port than the
+                # one we were asked to probe. Tell the caller via the
+                # reason string so it can use the correct port.
+                return True, f"docker_exec_pg_isready:host_port={mapped}"
             return True, "docker_exec_pg_isready"
         # If docker exec succeeded but pg_isready returned non-zero,
         # the container exists but PG isn't ready yet.
@@ -348,6 +376,45 @@ def probe_pg(host: str, port: int, timeout: float = 2.0,
 
     # No way to confirm — refuse to claim success. TCP-only is misleading.
     return False, "no_pg_isready_or_psql_available_for_verification"
+
+
+def _get_container_pg_host_port(
+        container: str = "claude-dejavu-postgres") -> int | None:
+    """Return the host-side TCP port bound to the container's 5432, or
+    None if the container is missing or has no port published.
+
+    Without this, `docker_exec_pg_isready` would lie about reachability
+    on the probed port — `docker exec` works inside the container's
+    loopback regardless of whether the port is published to the host,
+    so a container with `expose: 5432` but no `ports: 5454:5432` would
+    falsely satisfy probe_pg('localhost', 5432) even though no host
+    listener exists. config.env would then carry the wrong port and
+    every runtime client (doctor, recall, MCP) would time out.
+
+    `docker port` returns lines like:
+      0.0.0.0:5454
+      [::]:5454
+    We pick the first valid IPv4 mapping.
+    """
+    if not shutil.which("docker"):
+        return None
+    r = subprocess.run(
+        ["docker", "port", container, "5432"],
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        timeout=5,
+    )
+    if r.returncode != 0:
+        return None
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        try:
+            return int(line.rsplit(":", 1)[1])
+        except ValueError:
+            continue
+    return None
 
 
 _WEAVIATE_REQUIRED_META_KEYS = {"version", "modules"}
@@ -472,6 +539,11 @@ def step_data_root(args) -> Path:
 
 def step_postgres(args, data_dir: Path) -> dict:
     cyan("[2/6] Postgres")
+    # Single `global` declaration at the top — Python rejects
+    # multiple `global X` lines within the same function, and we
+    # have two assignment sites below (the existing detection
+    # branch and the auto-provision branch).
+    global _USE_BUNDLED_PG_PSQL
     detected_port = None
     detected_method = None
     for p in (5432, 5450, 5433, 5434):
@@ -480,10 +552,41 @@ def step_postgres(args, data_dir: Path) -> dict:
             detected_port = p; detected_method = why; break
 
     if detected_port:
+        # probe_pg's docker-exec branch may have detected that the
+        # container is published on a DIFFERENT host port than the
+        # one we probed (e.g., compose default `5454:5432` while
+        # we probed 5432 first). The reason string then carries
+        # `host_port=<actual>` — honor it so config.env gets the
+        # right port. Without this, runtime psycopg2 (doctor, recall,
+        # MCP) would time out on the wrong port even though install
+        # itself succeeded via `docker exec`.
+        if detected_method.startswith("docker_exec_pg_isready") \
+                and "host_port=" in detected_method:
+            try:
+                actual = int(detected_method.split("host_port=", 1)[1])
+                if actual != detected_port:
+                    yellow(f"  ⚠ Probed {detected_port} but container "
+                              f"is published on {actual} — using {actual}.")
+                    detected_port = actual
+            except ValueError:
+                pass
+            detected_method = "docker_exec_pg_isready"
+
         green(f"  ✓ Detected Postgres on localhost:{detected_port}  (verified via {detected_method})")
         host = "localhost"; port = str(detected_port)
         user = ask("    PG user", "postgres", args.non_interactive)
         password = ask("    PG password", "postgres", args.non_interactive)
+        # If probe verified via docker exec, the bundled-style
+        # container exists and has psql inside it — set the flag so
+        # subsequent _run_psql() calls use `docker exec` instead of
+        # demanding a host psql that Windows users typically don't
+        # have. Without this, the install fell through to
+        # "psql not found in PATH" even though the container was
+        # right there serving requests. The user-facing notice is
+        # printed once below at the host_psql/_USE_BUNDLED_PG_PSQL
+        # branch (avoids a duplicate line on this code path).
+        if detected_method == "docker_exec_pg_isready":
+            _USE_BUNDLED_PG_PSQL = True
     else:
         yellow("  No Postgres detected on common ports (5432, 5450, 5433, 5434).")
         choice = ask(
@@ -662,7 +765,6 @@ def step_postgres(args, data_dir: Path) -> dict:
                         "for the actual startup error, then re-run "
                         "scripts/install.py --auto")
             host, port, user, password = "localhost", "5454", "postgres", "postgres"
-            global _USE_BUNDLED_PG_PSQL
             _USE_BUNDLED_PG_PSQL = True
             green(f"    ✓ Bundled Postgres up on {host}:{port}")
         else:
@@ -705,15 +807,29 @@ def step_postgres(args, data_dir: Path) -> dict:
         cyan(f"    Using `docker exec claude-dejavu-postgres psql` "
                 f"(host psql not on PATH — Windows-friendly path).")
 
-    # Create DB if missing (idempotent). The CREATE DATABASE may emit
-    # "already exists" — that's fine, we ignore the return code on
-    # the create call.
-    _run_psql(host, port, user, password, None, [
-        "-tc", f"SELECT 1 FROM pg_database WHERE datname='{db}'"
+    # Check whether the database already exists, and only CREATE if
+    # it doesn't. Earlier the SELECT was issued but its result was
+    # discarded — install ran CREATE DATABASE unconditionally and
+    # ignored the failure. That made every reinstall log an
+    # ERROR-level "database already exists" line in the Postgres
+    # server log, which looked like a real failure to anyone tailing
+    # `docker logs claude-dejavu-postgres`. Now we actually consult
+    # the check.
+    exists = _run_psql(host, port, user, password, None, [
+        "-tAc", f"SELECT 1 FROM pg_database WHERE datname='{db}'"
     ])
-    _run_psql(host, port, user, password, None, [
-        "-c", f"CREATE DATABASE {db}"
-    ])
+    db_exists = (exists.stdout or "").strip() == "1"
+    if db_exists:
+        cyan(f"    Database {db} already exists — reusing.")
+    else:
+        cr = _run_psql(host, port, user, password, None, [
+            "-c", f"CREATE DATABASE {db}"
+        ])
+        if cr.returncode != 0:
+            _fail(args, "create_database_failed",
+                    f"CREATE DATABASE {db} failed",
+                    f"psql stderr: {(cr.stderr or '')[:300]}\n"
+                    f"Re-run: python scripts/install.py --auto")
     r = _run_psql(host, port, user, password, db, [],
                       input_file=SCHEMA_FILE)
     if r.returncode != 0:

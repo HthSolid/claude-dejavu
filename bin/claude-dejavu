@@ -1,31 +1,81 @@
 #!/bin/bash
 # claude-dejavu CLI — thin wrapper around code/recall.py + bundled venv (POSIX).
 #
-# install.py also generates a per-install wrapper at ~/.local/bin/claude-dejavu
+# install.py also generates a per-install wrapper at
+#   ~/.local/bin/claude-dejavu                 (Linux/macOS)
+#   %LOCALAPPDATA%\claude-dejavu\bin\claude-dejavu.bat   (Windows)
 # pointing at the user's venv directly. This file is kept for users who run
-# `bin/claude-dejavu` straight out of the plugin clone.
-#
-# Tries python3 first (canonical POSIX name), falls back to python (which the
-# venv module symlinks to on some distros).
+# `bin/claude-dejavu` straight out of the plugin clone, AND because Claude
+# Code's slash-command bash invocations on Windows (Git-Bash / MSYS2) end up
+# here when the per-install wrapper isn't on PATH yet.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA_ROOT="${CLAUDE_DEJAVU_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-dejavu}"
+
+# OS detection: Windows-via-bash (Git-Bash / MSYS2 / Cygwin) needs a
+# different data-root + venv layout + system-python fallback than POSIX.
+# Without this, on Windows the wrapper resolves DATA_ROOT to
+# /c/Users/<user>/.local/share/claude-dejavu (which doesn't exist —
+# install.py uses %LOCALAPPDATA% on Windows), can't find the venv
+# (Windows venvs put python at venv/Scripts/python.exe, not venv/bin/),
+# and falls through to system `python3`, which on most Windows boxes is
+# the Microsoft Store alias stub that prints a German Store-redirect
+# message and exits 9009.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WIN=1 ;;
+  *)                    IS_WIN=0 ;;
+esac
+
+if [ "$IS_WIN" = "1" ]; then
+  # Mirrors install.py:_default_data_root() for Windows.
+  DEFAULT_DATA="${LOCALAPPDATA:-${APPDATA:-$HOME/AppData/Local}}/claude-dejavu"
+else
+  # Mirrors install.py:_default_data_root() for Linux (Darwin uses
+  # ~/Library/Application Support but that's fine — the per-install
+  # wrapper at ~/.local/bin/claude-dejavu also runs on macOS and
+  # this fallback path matches the Linux default; macOS users with
+  # CLAUDE_DEJAVU_DATA_ROOT set still hit the override path below).
+  DEFAULT_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/claude-dejavu"
+fi
+DATA_ROOT="${CLAUDE_DEJAVU_DATA_ROOT:-$DEFAULT_DATA}"
 VENV="$DATA_ROOT/venv"
 
 # Resolve the venv interpreter if it exists.
-if [ -x "$VENV/bin/python3" ]; then
-  PYBIN="$VENV/bin/python3"
-elif [ -x "$VENV/bin/python" ]; then
-  PYBIN="$VENV/bin/python"
+if [ "$IS_WIN" = "1" ]; then
+  # Windows venv layout: <venv>\Scripts\python.exe (no bin/, capital S).
+  if [ -x "$VENV/Scripts/python.exe" ]; then
+    PYBIN="$VENV/Scripts/python.exe"
+  elif [ -x "$VENV/Scripts/python3.exe" ]; then
+    PYBIN="$VENV/Scripts/python3.exe"
+  else
+    PYBIN=""
+  fi
 else
-  PYBIN=""
+  if [ -x "$VENV/bin/python3" ]; then
+    PYBIN="$VENV/bin/python3"
+  elif [ -x "$VENV/bin/python" ]; then
+    PYBIN="$VENV/bin/python"
+  else
+    PYBIN=""
+  fi
 fi
 
 # Read-only diagnostic subcommands (doctor, logs) work without the
 # venv — they only need stdlib. If the venv is missing AND the user
-# is asking for one of those, fall back to the system python so they
+# is asking for one of those, fall back to a system python so they
 # can still see what's wrong with the install. Without this fallback
 # the wrapper would die with "venv missing" and the user would have
 # no diagnostic information.
+#
+# System-python fallback order matters: on Windows, `python3` is
+# almost always the Microsoft Store alias stub (prints German
+# Store-redirect and exits non-zero), so we MUST try `py` (Python
+# launcher) and `python` first. On Linux/macOS the canonical name is
+# `python3`.
+if [ "$IS_WIN" = "1" ]; then
+  SYS_PY_CANDIDATES=(py python python3)
+else
+  SYS_PY_CANDIDATES=(python3 python py)
+fi
+
 if [ -z "$PYBIN" ]; then
   # `doctor` works without the venv — code/doctor.py has only stdlib
   # imports at module top, and per-check psycopg2/etc. imports are
@@ -33,8 +83,15 @@ if [ -z "$PYBIN" ]; then
   # exactly what the user needs when the venv itself is the
   # problem: a diagnostic that can run anyway and tells them.
   if [ "${1:-}" = "doctor" ]; then
-    for sys_py in python3 python py; do
+    for sys_py in "${SYS_PY_CANDIDATES[@]}"; do
       if command -v "$sys_py" >/dev/null 2>&1; then
+        # Skip the Microsoft Store stub even if it's first on PATH.
+        # The stub appears as a real executable but always exits
+        # non-zero. We probe with `--version` (very cheap, exits 0
+        # on a real interpreter, non-zero on the stub).
+        if ! "$sys_py" --version >/dev/null 2>&1; then
+          continue
+        fi
         echo "claude-dejavu: venv missing — running 'doctor' via $sys_py" >&2
         echo "  (deps-requiring checks will skip; venv check will fail" >&2
         echo "   loud — that's the actual problem to fix)" >&2
@@ -44,8 +101,13 @@ if [ -z "$PYBIN" ]; then
     done
   fi
   echo "claude-dejavu: venv missing at $VENV" >&2
-  echo "  Run: python scripts/install.py --auto" >&2
-  echo "  Or:  python3 scripts/install.py --auto" >&2
+  if [ "$IS_WIN" = "1" ]; then
+    echo "  Run: py scripts/install.py --auto" >&2
+    echo "  Or:  python scripts/install.py --auto" >&2
+  else
+    echo "  Run: python3 scripts/install.py --auto" >&2
+    echo "  Or:  python scripts/install.py --auto" >&2
+  fi
   if [ -f "$DATA_ROOT/INSTALL_STATUS" ]; then
     echo "" >&2
     echo "  INSTALL_STATUS marker (last install attempt's state):" >&2

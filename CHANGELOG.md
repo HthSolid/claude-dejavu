@@ -4,6 +4,113 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.6.1] — 2026-05-08
+
+Hotfix for the v0.6.0 install path on Windows.
+
+### Fixed
+
+- **`_USE_BUNDLED_PG_PSQL` is now also set when probe_pg detected
+  via `docker_exec_pg_isready`.** v0.6.0 only set the flag in the
+  auto-provision branch (when install.py just spun up the bundled
+  stack), not in the detection branch (when the container was
+  already running from a prior install). On Windows that meant: PG
+  was reachable via `docker exec`, install.py confirmed it, but
+  then `_run_psql()` for schema apply demanded host psql/psql.exe
+  on PATH — which Windows users typically don't have. The install
+  failed at "psql not found in PATH and bundled Postgres container
+  is not in use" even though the container was right there.
+
+  Now: when probe_pg's reason is `docker_exec_pg_isready`, the
+  bundled-PSQL flag is enabled, and `_run_psql()` routes through
+  `docker exec claude-dejavu-postgres psql` for the schema apply.
+
+- **Single `global _USE_BUNDLED_PG_PSQL` declaration at the top of
+  `step_postgres()`.** Python rejects multiple `global X`
+  declarations within the same function; the v0.6.0 fix
+  introduced a second one which crashed the installer at module
+  parse time on the affected code path.
+
+- **`_run_psql()` now forces UTF-8 on stdin/stdout/stderr.** Every
+  `subprocess.run(...)` in `_run_psql` now passes
+  `encoding="utf-8", errors="replace"` explicitly. Without this,
+  Python falls back to the locale codec (cp1252 on most Windows
+  shells), which raises `UnicodeEncodeError` the moment
+  `schema.sql`'s em-dash / box-drawing characters reach the psql
+  stdin pipe. Linux/macOS were unaffected because their locale
+  default is already UTF-8. Schema apply now succeeds end-to-end
+  on Windows via `docker exec`.
+
+- **No more duplicate "Using docker exec" notice** when probe
+  detected an existing bundled Postgres. The detection branch was
+  printing its own message before the canonical one fired in the
+  schema-apply section. Removed the early print; the single
+  notice in `step_postgres()` is now the only source.
+
+- **`doctor` now uses `docker exec` to verify the PG schema when
+  host psql is missing.** On Windows (and any *nix box without
+  postgres-client) the host typically has neither `psql` nor
+  `pg_isready` on PATH but the bundled container is running with
+  both binaries inside. Without this fallback, doctor would
+  short-circuit with a misleading "reachable on host:port but
+  couldn't verify schema (no psql or PG_DB)" warning even on a
+  fully healthy install where `PG_DB` was correctly set in
+  `config.env` — only host `psql` was missing. Doctor now mirrors
+  install's `_run_psql` shape: probes `pg_isready` inside the
+  container, runs schema-table queries via
+  `docker exec claude-dejavu-postgres psql`, and only falls back
+  to "skip"/"warn" when neither host tooling nor the bundled
+  container is available.
+
+- **`CREATE DATABASE` is now gated on the existing pg_database
+  check.** Earlier the `SELECT 1 FROM pg_database WHERE datname=...`
+  probe was issued but its result was discarded — install ran
+  `CREATE DATABASE` unconditionally and ignored the failure. Every
+  reinstall logged an `ERROR: database "..." already exists` line
+  in the Postgres server log, which looked like a real failure to
+  anyone tailing `docker logs claude-dejavu-postgres`. Now the
+  SELECT result is consulted and `CREATE DATABASE` only fires on
+  first install.
+
+- **`probe_pg()` now reports the container's actual published host
+  port.** When verification went through `docker exec pg_isready`,
+  the install loop assumed the probed port (5432) matched the
+  host-side mapping. The bundled compose publishes Postgres on
+  `5454:5432`, so install would write `PG_PORT=5432` into
+  `config.env` even though nothing on the host is listening there.
+  Result: `claude-dejavu doctor` and runtime psycopg2 clients
+  (recall, MCP) all timed out on a fresh, otherwise-successful
+  install — only the install itself worked because every
+  install-time PG call goes through `docker exec`.
+
+  Now: when the docker-exec probe succeeds, install also runs
+  `docker port claude-dejavu-postgres 5432`, picks up the actual
+  host-published port (e.g., 5454), and writes that into
+  `config.env`. If no host port is published at all, the probe
+  refuses success so `step_postgres` falls into the auto-provision
+  branch (which publishes the port via compose).
+
+- **`bin/claude-dejavu` is now Windows-aware.** Claude Code's
+  slash-command bash invocations on Windows (Git-Bash / MSYS2)
+  end up in this POSIX wrapper before the per-install
+  `claude-dejavu.bat` is on PATH. Previously the wrapper resolved
+  the data root to `/c/Users/<user>/.local/share/claude-dejavu`
+  (which doesn't exist — install.py uses `%LOCALAPPDATA%` on
+  Windows), couldn't find the venv (Windows venvs put python at
+  `venv/Scripts/python.exe`, not `venv/bin/python3`), and fell
+  through to system `python3` — which on most Windows boxes is
+  the Microsoft Store alias stub that prints German Store-redirect
+  text and exits non-zero. Result: `claude-dejavu doctor` failed
+  before it could run a single check, even on a fresh successful
+  install.
+
+  Now: on `MINGW*` / `MSYS*` / `CYGWIN*` (`uname -s`) the wrapper
+  uses `%LOCALAPPDATA%\claude-dejavu`, looks for
+  `venv/Scripts/python*.exe`, and the system fallback tries `py`
+  + `python` before `python3` (also probing each candidate with
+  `--version` to skip the MS Store stub even if it's first on
+  PATH).
+
 ## [0.6.0] — 2026-05-06
 
 **Cloud embedding tier shipped.** New optional path that routes session

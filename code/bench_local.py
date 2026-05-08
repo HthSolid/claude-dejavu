@@ -214,8 +214,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             print(
-                "\n  → claude-dejavu Pro: managed cloud"
-                "endpoint with sub-100ms gists, no key setup. Coming v0.6.",
+                "\n  → claude-dejavu Pro: managed cloud endpoint "
+                "with sub-100ms gists, no key setup. Coming v0.6.",
                 file=sys.stderr,
             )
     return 0

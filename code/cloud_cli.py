@@ -363,12 +363,12 @@ def _finalize_login(key: str) -> int:
     except OSError:
         pass
     print(f"  wrote {cfg_path}")
-    print("  cloud mode is now active. Future ingest will route through the cloud worker.")
+    print("  cloud mode is now active. Future ingest will route through the managed embedder.")
     print("  privacy reminder: cloud mode sends turn text to a managed embedder.")
-    print("                    The upstream provider does not log content")
-    print("                    by default and never trains on your data, but their TOS")
-    print("                    allows brief debug logging. Use `claude-dejavu logout`")
-    print("                    to switch back to local mode any time.")
+    print("                    The upstream provider does not log content by default")
+    print("                    and never trains on your data, but their TOS allows brief")
+    print("                    debug logging. Use `claude-dejavu logout` to switch back")
+    print("                    to local mode any time.")
     return 0
 
 

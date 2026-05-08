@@ -183,6 +183,29 @@ def test_install_py_utf8_reconfigure_present() -> None:
          'reconfigure(encoding="utf-8"' in src)
 
 
+def test_doctor_postgres_falls_back_to_docker_exec() -> None:
+    # On Windows the host typically has neither psql nor pg_isready
+    # on PATH but the bundled container is up. Doctor must use the
+    # same `docker exec` fallback that install._run_psql does so it
+    # can verify the schema. Without this, doctor shows a misleading
+    # "no psql or PG_DB" warning even on a fully healthy install.
+    _step("code/doctor.py uses docker-exec fallback for psql when "
+            "host psql is missing")
+    src = (ROOT / "code" / "doctor.py").read_text()
+    _aT("_docker_exec_psql_available helper exists",
+         "_docker_exec_psql_available" in src)
+    _aT("_run_psql_dejavu helper exists",
+         "_run_psql_dejavu" in src)
+    _aT("uses use_docker_exec when host psql is missing",
+         "use_docker_exec = (not psql)" in src)
+    _aT("docker-exec branch probes pg_isready inside the container",
+         '"docker", "exec", "claude-dejavu-postgres",' in src
+         and '"pg_isready"' in src)
+    _aT("no direct subprocess.run on `psql` outside helper",
+         "subprocess.run(\n            [psql," not in src
+         and "subprocess.run(\n        [psql," not in src)
+
+
 def test_migrations_dir_layout() -> None:
     _step("code/migrations/ exists and has README")
     mdir = ROOT / "code" / "migrations"
@@ -208,6 +231,98 @@ def test_run_psql_falls_back_to_docker_exec() -> None:
          install._USE_BUNDLED_PG_PSQL is False)
 
 
+def test_create_database_is_gated_on_select() -> None:
+    # Earlier the SELECT-from-pg_database check was issued but its
+    # result was discarded — install ran CREATE DATABASE
+    # unconditionally. Postgres logged an ERROR-level "database
+    # X already exists" line on every reinstall, which looked
+    # alarming to anyone tailing `docker logs`.
+    _step("install gates CREATE DATABASE on the SELECT result")
+    src = (ROOT / "scripts" / "install.py").read_text()
+    _aT("uses -tAc for parseable output",
+         '"-tAc"' in src and "SELECT 1 FROM pg_database" in src)
+    _aT("checks db_exists before issuing CREATE DATABASE",
+         "db_exists" in src)
+    _aT("only issues CREATE DATABASE in the else branch",
+         "if db_exists:" in src and "CREATE DATABASE" in src)
+
+
+def test_probe_pg_uses_container_host_port_mapping() -> None:
+    # `docker exec pg_isready` works regardless of host port mapping
+    # (it goes at the container's loopback). Without consulting
+    # `docker port`, install.py would write the probed port (e.g.,
+    # 5432) into config.env even when the container is actually
+    # published on 5454 — every runtime client then times out.
+    _step("probe_pg consults `docker port` when verifying via "
+            "docker exec, and step_postgres honors the override")
+    install = _import_install()
+    _aT("_get_container_pg_host_port helper exists",
+         hasattr(install, "_get_container_pg_host_port"))
+    src = (ROOT / "scripts" / "install.py").read_text()
+    _aT("probe_pg returns host_port=<n> when mapping mismatches",
+         "host_port={mapped}" in src)
+    _aT("probe_pg refuses success when no host port published",
+         "docker_exec_ok_but_no_host_port_published" in src)
+    _aT("step_postgres parses host_port= override from reason",
+         '"host_port=" in detected_method' in src)
+
+
+def test_bin_wrapper_is_windows_aware() -> None:
+    # bin/claude-dejavu is invoked by Claude Code's slash commands via
+    # Bash even on Windows (Git-Bash). The wrapper must (a) compute
+    # the data root from %LOCALAPPDATA%, not $XDG_DATA_HOME; (b) look
+    # for the venv at venv/Scripts/python.exe, not venv/bin/python3;
+    # and (c) skip `python3` in the system fallback because that's
+    # the Microsoft Store alias stub on most Windows boxes.
+    _step("bin/claude-dejavu handles Windows-via-bash")
+    src = (ROOT / "bin" / "claude-dejavu").read_text()
+    _aT("detects MSYS/MINGW/CYGWIN via uname -s",
+         "MINGW" in src and "MSYS" in src and "CYGWIN" in src)
+    _aT("uses LOCALAPPDATA on Windows",
+         "LOCALAPPDATA" in src)
+    _aT("knows the Windows venv layout (Scripts/python.exe)",
+         "Scripts/python.exe" in src)
+    _aT("system fallback prefers `py` on Windows",
+         "SYS_PY_CANDIDATES=(py" in src)
+    _aT("filters out the MS Store python3 stub via --version probe",
+         '"$sys_py" --version' in src)
+
+
+def test_run_psql_forces_utf8_subprocess_encoding() -> None:
+    # On Windows, subprocess.run(text=True) defaults to cp1252 — which
+    # fails the moment schema.sql's em-dash / box-drawing chars hit
+    # stdin. Pin the fix so we can't regress.
+    _step("install._run_psql passes encoding='utf-8' to every "
+            "subprocess.run call")
+    import re
+    src = (ROOT / "scripts" / "install.py").read_text()
+    # Locate the function body.
+    start = src.index("def _run_psql(")
+    end = src.index("\ndef ", start + 1)
+    body = src[start:end]
+    run_calls = body.count("subprocess.run(")
+    # For every subprocess.run(...) call, the matching ) must be
+    # preceded by both encoding="utf-8" and errors="replace" within
+    # the same call. Count balanced-paren windows.
+    matches = list(re.finditer(r"subprocess\.run\(", body))
+    paired = 0
+    for m in matches:
+        i = m.end()
+        depth = 1
+        while i < len(body) and depth > 0:
+            if body[i] == "(":
+                depth += 1
+            elif body[i] == ")":
+                depth -= 1
+            i += 1
+        call = body[m.end():i]
+        if 'encoding="utf-8"' in call and 'errors="replace"' in call:
+            paired += 1
+    _aT(f"every subprocess.run paired with utf-8+replace "
+         f"({paired}/{run_calls})",
+         paired == run_calls and run_calls > 0)
+
+
 def main() -> int:
     print("claude-dejavu v0.5.0e install.py + helpers tests")
     print(f"  ROOT={ROOT}")
@@ -225,6 +340,11 @@ def main() -> int:
         test_migrations_dir_layout,
         test_apply_schema_migrations_helper_exists,
         test_run_psql_falls_back_to_docker_exec,
+        test_run_psql_forces_utf8_subprocess_encoding,
+        test_bin_wrapper_is_windows_aware,
+        test_probe_pg_uses_container_host_port_mapping,
+        test_create_database_is_gated_on_select,
+        test_doctor_postgres_falls_back_to_docker_exec,
     ]
     for t in tests:
         try:

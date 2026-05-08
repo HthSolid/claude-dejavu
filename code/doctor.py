@@ -174,6 +174,55 @@ def _check_venv(rep: Report) -> Path | None:
     return py
 
 
+def _docker_exec_psql_available() -> bool:
+    """True iff `docker exec claude-dejavu-postgres psql --version` works.
+
+    Used as a Windows-friendly fallback when the host doesn't have
+    psql/pg_isready on PATH but the bundled container is running.
+    Without this, doctor would report a misleading "no psql or PG_DB"
+    warning even on a fully healthy install (PG_DB is in config.env;
+    only host psql is missing)."""
+    if not shutil.which("docker"):
+        return False
+    r = subprocess.run(
+        ["docker", "exec", "claude-dejavu-postgres",
+          "psql", "--version"],
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        timeout=5,
+    )
+    return r.returncode == 0
+
+
+def _run_psql_dejavu(host: str, port: str, user: str, password: str,
+                      db: str | None, args: list[str], *,
+                      use_docker_exec: bool,
+                      ) -> subprocess.CompletedProcess:
+    """Mirror of install._run_psql for doctor — host psql first, else
+    `docker exec claude-dejavu-postgres psql` against the bundled
+    container."""
+    env = {**os.environ, "PGPASSWORD": password}
+    if not use_docker_exec:
+        psql = shutil.which("psql") or "psql"
+        cmd = [psql, "-h", host, "-p", str(port), "-U", user]
+        if db:
+            cmd += ["-d", db]
+        cmd += args
+        return subprocess.run(cmd, env=env, capture_output=True,
+                                  text=True, encoding="utf-8",
+                                  errors="replace", timeout=5)
+    cmd = ["docker", "exec", "-i",
+            "-e", f"PGPASSWORD={password}",
+            "claude-dejavu-postgres", "psql",
+            "-h", "localhost", "-p", "5432", "-U", user]
+    if db:
+        cmd += ["-d", db]
+    cmd += args
+    return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=8)
+
+
 def _check_postgres(cfg: dict, rep: Report) -> bool:
     host = cfg.get("PG_HOST", "localhost")
     port = cfg.get("PG_PORT", "5432")
@@ -182,6 +231,13 @@ def _check_postgres(cfg: dict, rep: Report) -> bool:
     db = cfg.get("PG_DB", "")
     psql = shutil.which("psql")
     pg_isready = shutil.which("pg_isready")
+    # Windows installs (and any *nix box without postgres-client)
+    # have neither binary on PATH but DO have the bundled container.
+    # Mirror install._run_psql's behavior: fall back to
+    # `docker exec claude-dejavu-postgres psql` so doctor can still
+    # verify the schema. Without this, doctor warns "no psql or
+    # PG_DB" on a fully healthy Windows install.
+    use_docker_exec = (not psql) and _docker_exec_psql_available()
 
     if pg_isready:
         r = subprocess.run(
@@ -196,23 +252,52 @@ def _check_postgres(cfg: dict, rep: Report) -> bool:
                      f"  docker compose -f {_plugin_root()}/docker/docker-compose.minimal.yml up -d"),
             ))
             return False
+    elif use_docker_exec:
+        # Probe via the bundled container's pg_isready. Doesn't go
+        # through host networking — verifies the container itself is
+        # serving rather than the host port. That's actually what we
+        # want here: install.py's earlier port-mapping fix already
+        # ensures config.env carries the correct host port; this
+        # check just confirms the cluster is alive.
+        r = subprocess.run(
+            ["docker", "exec", "claude-dejavu-postgres",
+              "pg_isready", "-U", user, "-d", "postgres", "-t", "3"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5,
+        )
+        if r.returncode != 0:
+            rep.add(CheckResult(
+                "postgres", "fail",
+                detail=("docker exec pg_isready says container is "
+                          "not accepting connections"),
+                fix=("Start the bundled stack:\n"
+                     f"  docker compose -f {_plugin_root()}/docker/docker-compose.minimal.yml up -d"),
+            ))
+            return False
     elif not psql:
         rep.add(CheckResult(
             "postgres", "skip",
-            detail="neither pg_isready nor psql found in PATH; cannot verify",
+            detail="neither pg_isready nor psql nor bundled container found; cannot verify",
         ))
         return False
 
-    # Verify schema by counting expected tables.
-    if not psql or not db:
-        rep.add(CheckResult("postgres", "warn",
-                            detail=f"reachable on {host}:{port} but couldn't verify schema (no psql or PG_DB)"))
+    # Verify schema by counting expected tables. With the docker-exec
+    # fallback, we no longer need host psql to do this — only PG_DB.
+    if (not psql and not use_docker_exec) or not db:
+        if not db:
+            detail = (f"reachable on {host}:{port} but PG_DB is empty in "
+                          f"config.env — re-run scripts/install.py --auto")
+        else:
+            detail = (f"reachable on {host}:{port} but no psql on PATH "
+                          f"and bundled container not running for docker-exec "
+                          f"fallback")
+        rep.add(CheckResult("postgres", "warn", detail=detail))
         return True
-    env = {**os.environ, "PGPASSWORD": password}
-    r = subprocess.run(
-        [psql, "-h", host, "-p", str(port), "-U", user, "-d", db, "-tA",
-         "-c", "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"],
-        env=env, capture_output=True, text=True, timeout=5,
+    r = _run_psql_dejavu(
+        host, port, user, password, db,
+        ["-tA", "-c",
+         "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"],
+        use_docker_exec=use_docker_exec,
     )
     if r.returncode != 0:
         rep.add(CheckResult(
@@ -235,12 +320,12 @@ def _check_postgres(cfg: dict, rep: Report) -> bool:
         expected = set()
     if expected:
         # Get the actual set of public tables
-        r2 = subprocess.run(
-            [psql, "-h", host, "-p", str(port), "-U", user, "-d", db,
-              "-tA", "-c",
+        r2 = _run_psql_dejavu(
+            host, port, user, password, db,
+            ["-tA", "-c",
               "SELECT table_name FROM information_schema.tables "
               "WHERE table_schema='public'"],
-            env=env, capture_output=True, text=True, timeout=5,
+            use_docker_exec=use_docker_exec,
         )
         if r2.returncode == 0:
             actual = {ln.strip() for ln in (r2.stdout or "").splitlines()

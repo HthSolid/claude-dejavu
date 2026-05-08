@@ -188,6 +188,48 @@ raise RuntimeError('escaped')
          content[:300])
 
 
+def test_install_excepthook_unwraps_exception_group() -> None:
+    # Pre-fix bug: FastMCP TaskGroup errors logged as
+    # `uncaught ExceptionGroup: ... (1 sub-exception)` and the
+    # inner traceback (the real psycopg2 / runtime error) was
+    # never captured. The hook now unwraps groups and logs each
+    # sub-exception as its own record with its own traceback.
+    _step("install_excepthook unwraps ExceptionGroup sub-exceptions")
+    tmp, env = _isolated_env()
+    script = f"""
+import sys
+sys.path.insert(0, {str(ROOT / 'code')!r})
+from error_log import install_excepthook
+install_excepthook(component='test.eg')
+def inner():
+    raise RuntimeError('inner-root-cause')
+try:
+    inner()
+except Exception as exc:
+    raise BaseExceptionGroup('TaskGroup wrapper', [exc])
+"""
+    r = subprocess.run([sys.executable, "-c", script], env=env,
+                          capture_output=True, text=True)
+    if r.returncode == 0:
+        _fail_("excepthook didn't propagate the crash"); return
+    logfile = Path(tmp) / "claude-dejavu" / "errors.log"
+    if not logfile.exists():
+        _fail_(f"log not created at {logfile}"); return
+    content = logfile.read_text()
+    # The wrapper breadcrumb must still appear (so users grepping
+    # for ExceptionGroup find their error)…
+    _aT("ExceptionGroup wrapper logged as breadcrumb",
+         "ExceptionGroup" in content and "group depth=0" in content,
+         content[:300])
+    # …and the inner traceback must be present so the actual root
+    # cause is debuggable.
+    _aT("inner sub-exception logged with its own traceback",
+         "sub[depth=1]" in content
+         and "RuntimeError" in content
+         and "inner-root-cause" in content,
+         content[:500])
+
+
 def test_safe_on_disk_failure() -> None:
     _step("log_error never raises on disk failure")
     # Point XDG to a non-writable path
@@ -219,6 +261,7 @@ def main() -> int:
         test_rotation,
         test_log_path_str,
         test_install_excepthook,
+        test_install_excepthook_unwraps_exception_group,
         test_safe_on_disk_failure,
     ]
     for t in tests:

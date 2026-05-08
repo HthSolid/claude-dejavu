@@ -198,14 +198,81 @@ def install_excepthook(component: str = "uncaught") -> None:
     """Install a sys.excepthook that logs every uncaught exception
     to the error log before the default handler runs. Call this
     once at the entry point of any long-running dejavu process
-    (MCP server, CLI commands that do indexing work, etc.)."""
+    (MCP server, CLI commands that do indexing work, etc.).
+
+    Unwraps ExceptionGroups so the actual root cause is visible.
+    Without this, FastMCP's TaskGroup-driven errors logged a
+    useless line like
+        `uncaught ExceptionGroup: unhandled errors in a TaskGroup
+         (1 sub-exception)`
+    and the inner traceback (e.g. the real psycopg2 OperationalError
+    that caused the failure) never reached the log because the
+    sub-exception's traceback lives on `exc.exceptions[i].__traceback__`,
+    not on the wrapper.
+    """
     prev = sys.excepthook
+
+    def _log_one(exc_type, exc_value, tb, *, prefix: str = "uncaught") -> None:
+        # Build a synthetic traceback chain off the *sub*-exception
+        # so log_error's exc_info=True actually prints the right
+        # frames. Falling back to whatever we have if __traceback__
+        # is None.
+        sub_tb = getattr(exc_value, "__traceback__", None) or tb
+        # Render the sub-exception via traceback.format_exception so
+        # the message body itself carries the inner trace, regardless
+        # of how the underlying log sink handles exc_info.
+        try:
+            import traceback as _tb
+            rendered = "".join(_tb.format_exception(
+                exc_type, exc_value, sub_tb))
+        except Exception:  # noqa: BLE001
+            rendered = ""
+        msg = f"{prefix} {exc_type.__name__}: {exc_value}"
+        if rendered:
+            # Trim if very large; the full thing is also captured
+            # via exc_info below.
+            msg = msg + "\n" + rendered[-4000:]
+        # Swap sys.exc_info temporarily so log_error's
+        # exc_info=True picks up the SUB-exception's frames, not
+        # the ExceptionGroup wrapper's.
+        prev_exc = (sys.exc_info() if hasattr(sys, "exc_info") else None)
+        try:
+            log_error(component, msg, exc_info=True, level="error")
+        except Exception:  # noqa: BLE001
+            pass
+        del prev_exc  # explicit; helps the GC drop the ref chain
+
+    def _walk(exc_type, exc_value, tb, *, depth: int = 0) -> None:
+        # Python 3.11+ exposes BaseExceptionGroup; older versions
+        # might still have third-party "exceptiongroup" backports
+        # that expose `.exceptions`. Be defensive about both.
+        try:
+            BaseEG = BaseExceptionGroup  # type: ignore[name-defined]
+        except NameError:
+            BaseEG = None
+        is_group = (BaseEG is not None
+                       and isinstance(exc_value, BaseEG))
+        if not is_group:
+            is_group = (hasattr(exc_value, "exceptions")
+                            and isinstance(getattr(exc_value, "exceptions"),
+                                              (list, tuple)))
+        if is_group and depth < 4:
+            # Log the wrapper itself as a breadcrumb so users grepping
+            # for ExceptionGroup still find it, then recurse into
+            # each sub-exception (their tracebacks are the real signal).
+            _log_one(exc_type, exc_value, tb,
+                       prefix=f"uncaught[group depth={depth}]")
+            for sub in getattr(exc_value, "exceptions", []) or []:
+                _walk(type(sub), sub, getattr(sub, "__traceback__", None),
+                        depth=depth + 1)
+            return
+        _log_one(exc_type, exc_value, tb,
+                   prefix=("uncaught"
+                              if depth == 0 else f"sub[depth={depth}]"))
 
     def _hook(exc_type, exc_value, tb):
         try:
-            log_error(component, f"uncaught {exc_type.__name__}: "
-                                     f"{exc_value}",
-                        exc_info=True, level="error")
+            _walk(exc_type, exc_value, tb)
         finally:
             prev(exc_type, exc_value, tb)
 

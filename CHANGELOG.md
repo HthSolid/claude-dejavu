@@ -4,6 +4,25 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.6.1b] — 2026-05-08
+
+Diagnostic logging fix on top of v0.6.1.
+
+### Fixed
+
+- **`install_excepthook` unwraps `ExceptionGroup` sub-exceptions.**
+  FastMCP's `mcp.run(transport="stdio")` runs inside an asyncio
+  TaskGroup; any uncaught error inside a task surfaces as a
+  `BaseExceptionGroup` whose `str()` is just
+  `unhandled errors in a TaskGroup (1 sub-exception)` and whose
+  traceback points at the wrapper, not the real failure. The
+  excepthook now walks `.exceptions`, logs the wrapper as a
+  breadcrumb, then logs each sub-exception with its own rendered
+  traceback. Pre-fix, the
+  `mcp.server: ExceptionGroup … (1 sub-exception)` lines in
+  `errors.log` lost the real psycopg2 / runtime stack; post-fix
+  they carry it.
+
 ## [0.6.1] — 2026-05-08
 
 Hotfix for the v0.6.0 install path on Windows.

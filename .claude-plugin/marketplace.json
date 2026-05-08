@@ -6,13 +6,13 @@
   "metadata": {
     "description": "Restore deleted Claude Code sessions, search past conversations, and ground LLM-generated code against your project's real schema. 89.3% reduction in hallucinated identifiers via a 14-strategy deterministic rewriter (51.5% → 5.5%, n=400).",
     "homepage": "https://github.com/HthSolid/claude-dejavu",
-    "version": "0.6.1"
+    "version": "0.6.1b"
   },
   "plugins": [
     {
       "name": "claude-dejavu",
       "source": "./",
-      "version": "0.6.1",
+      "version": "0.6.1b",
       "description": "Memory + recovery + code grounding. Restores deleted sessions, hybrid PG+Weaviate recall across every past conversation, tree-sitter symbol indexing across 12 languages, eight identifier-grounding domains (env / DB / route / GraphQL / flag / CSS / i18n / module-export), and a 14-strategy deterministic rewriter that catches fabrications before disk write. 89.3% reduction in hallucinated identifiers (51.5% → 5.5%, n=400).",
       "author": {
         "name": "HTE Switzerland"

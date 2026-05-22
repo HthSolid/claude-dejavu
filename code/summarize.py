@@ -399,7 +399,7 @@ if __name__ == "__main__":
         print("Usage: summarize.py <session-uuid> [pg_dsn]"); sys.exit(1)
     dsn = sys.argv[2] if len(sys.argv) > 2 else os.environ.get(
         "CLAUDE_DEJAVU_DSN",
-        "host=localhost port=5450 user=postgres password=postgres dbname=claude_audit",
+        "host=localhost port=5450 user=postgres password=postgres dbname=claude_dejavu_bench",
     )
     with psycopg2.connect(dsn) as conn:
         result = summarize_session(conn, sys.argv[1])

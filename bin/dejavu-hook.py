@@ -26,11 +26,14 @@ Usage (called from hooks.json):
     python "${CLAUDE_PLUGIN_ROOT}/bin/dejavu-hook.py" <hook-name> [args]
 
 Supported hook names:
-    setup           → scripts/install.py --auto
-    session-start   → hooks/session_start.py
-    stop            → hooks/stop.py
-    session-end     → hooks/session_end.py
-    pre-tool-use    → hooks/pre_tool_use.py
+    setup                 → scripts/install.py --auto
+    session-start         → hooks/session_start.py
+    session-start-digest  → hooks/session_start_digest.py
+    stop                  → hooks/stop.py
+    session-end           → hooks/session_end.py
+    pre-tool-use          → hooks/pre_tool_use.py
+    user-prompt-submit    → hooks/user_prompt_submit.py
+    pre-compact           → hooks/pre_compact.py
 
 Any extra args are forwarded.
 """
@@ -42,11 +45,14 @@ from pathlib import Path
 
 
 HOOK_TARGETS: dict[str, tuple[str, ...]] = {
-    "setup":         ("scripts", "install.py"),
-    "session-start": ("hooks", "session_start.py"),
-    "stop":          ("hooks", "stop.py"),
-    "session-end":   ("hooks", "session_end.py"),
-    "pre-tool-use":  ("hooks", "pre_tool_use.py"),
+    "setup":                ("scripts", "install.py"),
+    "session-start":        ("hooks", "session_start.py"),
+    "session-start-digest": ("hooks", "session_start_digest.py"),
+    "stop":                 ("hooks", "stop.py"),
+    "session-end":          ("hooks", "session_end.py"),
+    "pre-tool-use":         ("hooks", "pre_tool_use.py"),
+    "user-prompt-submit":   ("hooks", "user_prompt_submit.py"),
+    "pre-compact":          ("hooks", "pre_compact.py"),
 }
 
 EXTRA_ARGS_BY_HOOK: dict[str, tuple[str, ...]] = {

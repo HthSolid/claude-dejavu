@@ -11,14 +11,36 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ─── Workspaces ──────────────────────────────────────────────────────────────
--- Named groups of project slugs for shared recall (default scope unit).
+-- Named groups of repo IDs for shared recall (default scope unit).
 CREATE TABLE IF NOT EXISTS workspaces (
   name        TEXT PRIMARY KEY,
   description TEXT,
-  projects    TEXT[] NOT NULL DEFAULT '{}',
+  repo_ids    TEXT[] NOT NULL DEFAULT '{}',
   created_at  TIMESTAMPTZ DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_workspaces_projects ON workspaces USING gin (projects);
+CREATE INDEX IF NOT EXISTS idx_workspaces_repo_ids ON workspaces USING gin (repo_ids);
+
+-- ─── Repos registry ──────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS repos (
+  id              UUID PRIMARY KEY,
+  label           TEXT,
+  last_seen_path  TEXT,
+  created_at      TIMESTAMPTZ DEFAULT now(),
+  updated_at      TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_repos_last_seen_path ON repos(last_seen_path);
+
+-- ─── Doc file state cursor ───────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS doc_file_state (
+  repo_id       UUID NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  file_path     TEXT NOT NULL,
+  mtime         BIGINT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  chunk_count   INT NOT NULL,
+  embedded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (repo_id, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_file_state_repo ON doc_file_state(repo_id);
 
 -- One row per Claude Code session (parent .jsonl).
 CREATE TABLE IF NOT EXISTS sessions (
@@ -612,3 +634,107 @@ CREATE TABLE IF NOT EXISTS fabrication_history (
 CREATE INDEX IF NOT EXISTS idx_fabrication_project ON fabrication_history(project_slug);
 CREATE INDEX IF NOT EXISTS idx_fabrication_status ON fabrication_history(project_slug, status);
 CREATE INDEX IF NOT EXISTS idx_fabrication_count ON fabrication_history(project_slug, count DESC);
+
+-- ─── v0.8.8: cross-session embed cache ───────────────────────────────────────
+-- Context Economy phase 5. Embedding the same paraphrased query in a different
+-- session used to hit the cloud every time (the in-process LRU in
+-- query_embed.py only survives the lifetime of one CLI/hook invocation).
+-- This table persists exact-match-by-string hits across sessions so a query
+-- embedded by `claude-dejavu search` once never costs a second cloud call
+-- when JIT recall or another search runs against the same text.
+--
+-- Cache key:   blake2b(query, digest_size=16) — collision-resistant
+--              fixed-width key, never logs the full query in the path.
+-- Cache value: 1024-dim e5-large-instruct vector serialised as a JSON
+--              array of floats. JSONB lets us roundtrip without
+--              parser drift (vs. text+split-on-comma) and supports
+--              future shape evolution if we ever swap models.
+--
+-- Eviction:    bounded at 10 000 rows by `last_used_at`. Trim runs
+--              lazily from query_embed.py once every 256 inserts and
+--              optionally nightly via the scheduler. Idempotent —
+--              double-eviction is a no-op.
+--
+-- Privacy:    `query_text` is stored verbatim alongside the hash so
+--              operators can audit + redact specific entries. Drop the
+--              column with `ALTER TABLE embed_cache DROP COLUMN
+--              query_text` if your threat model requires hash-only.
+CREATE TABLE IF NOT EXISTS embed_cache (
+  query_hash    BYTEA PRIMARY KEY,
+  query_text    TEXT NOT NULL,
+  vector        JSONB NOT NULL,
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  last_used_at  TIMESTAMPTZ DEFAULT now(),
+  use_count     BIGINT DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_embed_cache_last_used
+    ON embed_cache (last_used_at DESC);
+
+-- ─── v0.9.6 — recall_feedback ───────────────────────────────────────────────
+-- Captures relevance signals for past dejavu_search hits so the reranker can
+-- boost turns that have proven useful in the past. Two signal types:
+--
+--   'implicit'      — the model called dejavu_expand on this turn shortly
+--                      after a dejavu_search; we infer the search was the
+--                      reason for the expansion. Weight 1.0.
+--   'explicit_up'   — the model called dejavu_rate(turn_id, +1, query?).
+--                      Weight 3.0 (stronger signal).
+--   'explicit_down' — dejavu_rate(turn_id, -1, query?). Weight -3.0.
+--
+-- The popularity-cache aggregator (mcp/server.py) reads this table every
+-- 30 minutes, computes a per-turn_id sum-of-weights over the last 30
+-- days, and uses it to boost the reranker score by `1 + log(1 + pop)`.
+-- See `_refresh_feedback_cache_if_stale` for the actual aggregation SQL.
+--
+-- Privacy: query_text is stored verbatim alongside its hash so an operator
+-- can audit + redact specific entries. Same convention as embed_cache.
+CREATE TABLE IF NOT EXISTS recall_feedback (
+  id           BIGSERIAL PRIMARY KEY,
+  query_hash   BYTEA NOT NULL,
+  query_text   TEXT,
+  turn_id      BIGINT NOT NULL,
+  session_id   UUID,
+  signal_type  TEXT NOT NULL CHECK (signal_type IN (
+                  'implicit', 'explicit_up', 'explicit_down')),
+  weight       REAL NOT NULL DEFAULT 1.0,
+  ts           TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_recall_feedback_turn_ts
+    ON recall_feedback (turn_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_recall_feedback_ts
+    ON recall_feedback (ts DESC);
+
+-- ─── v0.10.0 — recall_ranking_trials ────────────────────────────────────────
+-- Champion/challenger shadow log. Each dejavu_search inserts one row per
+-- hit shown to the model, with that hit's rank under BOTH rankers
+-- (heuristic = champion, learned = challenger). When a follow-up
+-- dejavu_expand fires inside the 60s attribution window, the trial
+-- gets `decided` set + the expanded turn's rank-under-each-ranker is
+-- aggregated into the promotion-arbiter's rolling-window stats.
+--
+-- Privacy posture matches recall_feedback: query_text stored verbatim
+-- alongside its hash; never transmitted off-machine.
+--
+-- The promotion arbiter (mcp/server.py) reads:
+--   - sum(challenger_rank < champion_rank) AS challenger_wins
+--   - sum(challenger_rank > champion_rank) AS challenger_losses
+-- over the last `CLAUDE_DEJAVU_RANKER_PROMOTE_MIN_N` decided trials.
+-- Promotes the challenger when win_rate ≥ CLAUDE_DEJAVU_RANKER_PROMOTE_WIN_RATE
+-- (default 0.60). Demotes symmetrically when a promoted challenger
+-- drops below 0.50 over a fresh 500-trial window.
+CREATE TABLE IF NOT EXISTS recall_ranking_trials (
+  id              BIGSERIAL PRIMARY KEY,
+  query_hash      BYTEA NOT NULL,
+  query_text      TEXT,
+  turn_id         BIGINT NOT NULL,
+  champion_rank   INTEGER NOT NULL,
+  challenger_rank INTEGER NOT NULL,
+  decided         BOOLEAN DEFAULT FALSE,
+  expanded        BOOLEAN DEFAULT FALSE,
+  ts              TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ranking_trials_query
+    ON recall_ranking_trials (query_hash, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_ranking_trials_decided
+    ON recall_ranking_trials (decided, ts DESC)
+    WHERE decided = TRUE;

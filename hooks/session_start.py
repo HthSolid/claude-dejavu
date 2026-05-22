@@ -333,25 +333,118 @@ def _kickoff_reindex_if_needed(project_slug: str, conn) -> str | None:
             f"grounding (running in background, ~seconds for small repos)…")
 
 
+def _check_migration_pending(data_root: Path) -> str | None:
+    """Return a one-line warning when ``$DATA_ROOT/migration-state.json``
+    exists with ``phase != 'done'`` (v0.8.0 migration in progress or
+    deferred). Bounded — fast file-read, no DB call.
+
+    Mirrors the v0.7.1 install-status / repair-notice slot pattern so
+    Claude surfaces the v0.8.0 migration nudge inline on session start.
+    """
+    try:
+        p = Path(data_root) / "migration-state.json"
+        if not p.is_file():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        phase = data.get("phase")
+        if phase == "done" or not phase:
+            return None
+        return ("⚠ claude-dejavu v0.8.0 migration pending. "
+                "Re-run install.py to complete it "
+                "(auto-runs in ~30-60 min).")
+    except Exception:
+        return None
+
+
+def _detect_corruption(session_id: str, transcript_path: str) -> str | None:
+    """Return a warning string if the live JSONL for ``session_id`` is
+    corrupted or truncated relative to dejavu's DB, else ``None``.
+
+    Bounded by a psycopg2 ``connect_timeout=1`` and a hard try/except
+    swallow so any failure (DB unreachable, repair module missing,
+    permissions) silently returns None instead of blocking session-start.
+    """
+    try:
+        from pathlib import Path as _P
+        live = _P(transcript_path) if transcript_path else None
+        if not live or not live.is_file():
+            return None
+        cfg = _load_cfg()
+        try:
+            import psycopg2  # local — may not be installed
+        except Exception:
+            return None
+        # Import repair from ../code/ (sys.path already includes it via
+        # the module-level prelude on line 26).
+        try:
+            import repair as _rp
+        except Exception:
+            return None
+        try:
+            with psycopg2.connect(_pg_dsn(cfg),
+                                  connect_timeout=1) as conn:
+                d = _rp.diagnose(session_id, live, conn)
+        except Exception:
+            return None
+        if d.healthy:
+            return None
+        flags = []
+        if d.corrupted:
+            flags.append(
+                f"corrupted ({d.corrupted_lines} parse-failing line(s))")
+        if d.truncated:
+            gap = max(d.db_turn_count - d.valid_lines, 0)
+            flags.append(
+                f"truncated ({d.db_turn_count} turns in DB; live has "
+                f"{d.valid_lines} lines vs DB max idx {d.db_max_idx} — "
+                f"~{gap} entries recoverable)")
+        return (
+            f"⚠ claude-dejavu detected this session: "
+            f"{' AND '.join(flags)}.\n"
+            f"  Run: claude-dejavu repair {session_id}\n"
+            f"  (A .pre-repair.<ts>.jsonl backup is made automatically.)\n"
+            f"  Source: dejavu DB (PG/Weaviate) — the off-tree mirror is "
+            f"not used."
+        )
+    except Exception:
+        return None
+
+
 def _build_preamble(latest_summary: dict | None, observations: list[dict],
                     update_notice: str | None = None,
                     reindex_notice: str | None = None,
                     install_notice: str | None = None,
                     bootstrap_notice: str | None = None,
-                    health_notice: str | None = None) -> str:
+                    health_notice: str | None = None,
+                    repair_notice: str | None = None,
+                    migration_notice: str | None = None) -> str:
     if not any([latest_summary, observations, update_notice, reindex_notice,
-                install_notice, bootstrap_notice, health_notice]):
+                install_notice, bootstrap_notice, health_notice,
+                repair_notice, migration_notice]):
         return ""
     lines = ["[claude-dejavu — context from prior sessions on this project]"]
     # Install status comes FIRST — if install is incomplete, nothing else
     # works and the user needs to see this before any normal preamble noise.
     if install_notice:
         lines.append(install_notice)
+    # v0.8.0 migration nudge — sits right under install_notice because it
+    # signals a pending upgrade step that the user needs to act on
+    # (same urgency as an incomplete install).
+    if migration_notice:
+        lines.append(migration_notice)
     # Health-repair notice next — if storage was just auto-repaired
     # the user needs to know (their data may have been lost; auto-
     # repair only restores schema, not contents).
     if health_notice:
         lines.append(health_notice)
+    # Corruption-of-current-session notice — the user is opening a session
+    # whose JSONL is broken / missing entries. Surface this near the top so
+    # they see the suggestion before the regular preamble noise.
+    if repair_notice:
+        lines.append(repair_notice)
     if update_notice:
         lines.append(update_notice)
     if bootstrap_notice:
@@ -402,11 +495,15 @@ def main():
     try:
         import psycopg2
     except Exception:
-        # No psycopg2 — install almost certainly incomplete. Make sure the
-        # install_notice gets through even without a DB connection.
-        if install_notice:
+        # No psycopg2 — install almost certainly incomplete. Make sure
+        # the install_notice + migration_notice get through even without
+        # a DB connection (both are file-read-only).
+        migration_notice = _check_migration_pending(_resolve_data_root())
+        if install_notice or migration_notice:
             print(json.dumps({"systemMessage": _build_preamble(
-                None, [], install_notice=install_notice)}))
+                None, [],
+                install_notice=install_notice,
+                migration_notice=migration_notice)}))
         else:
             print(json.dumps({"systemMessage": ""}))
         return
@@ -488,13 +585,50 @@ def main():
     except Exception:
         bootstrap_notice = None
 
+    # v0.8.6: surface dejavu_bridge mode so users notice if they're
+    # running in standard (stub) mode without the closed-source wheel.
+    # Adds one log line to stderr only (NOT the systemMessage block —
+    # we don't want to pollute the preamble with this on every start;
+    # it's an admin signal). The wheel availability check is cheap
+    # (single sys.path lookup + import-cache hit on second SessionStart).
+    try:
+        from distill_pipeline import BRIDGE_IS_STUB as _stub, \
+            BRIDGE_VERSION as _bv
+        if _stub:
+            print("[claude-dejavu] dejavu_bridge unavailable; "
+                  "running in standard mode "
+                  "(no compressed gist; raw content recall still works). "
+                  "See README §Dependencies for install instructions.",
+                  file=sys.stderr)
+        else:
+            print(f"[claude-dejavu] dejavu_bridge active (wheel "
+                  f"v{_bv}) — Context Economy phase 3 enabled.",
+                  file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        # Bridge import broken entirely — surface once but don't
+        # block the hook. Most likely a stale install; user will see
+        # this and run `claude-dejavu doctor`.
+        print("[claude-dejavu] distill_pipeline import failed; "
+              "ingest gists disabled this session.", file=sys.stderr)
+
     update_notice = _check_for_update(_local_plugin_version(), cfg)
+    # v0.7.1: auto-detect corruption / truncation of the session being
+    # started. The helper is itself fully try/except-wrapped + uses a
+    # 1s psycopg2 connect_timeout, so the hook can never block here.
+    repair_notice = _detect_corruption(
+        payload.get("session_id") or "",
+        payload.get("transcript_path") or "",
+    )
+    # v0.8.0: pending session-copy migration nudge.
+    migration_notice = _check_migration_pending(_resolve_data_root())
     msg = _build_preamble(latest_summary, observations,
                           update_notice=update_notice,
                           reindex_notice=reindex_notice,
                           install_notice=install_notice,
                           bootstrap_notice=bootstrap_notice if 'bootstrap_notice' in dir() else None,
-                          health_notice=health_notice)
+                          health_notice=health_notice,
+                          repair_notice=repair_notice,
+                          migration_notice=migration_notice)
     print(json.dumps({"systemMessage": msg}))
 
 

@@ -503,7 +503,7 @@ def index_project_env_vars(project_dir: str, project_slug: str, conn,
 
     # ─── v0.4.5: fingerprint cache ─────────────────────────────────────
     # env_indexer walks every TS/JS/Py file for `process.env.X` reads.
-    # On sofi-base-security that's 8k+ files. Skip if nothing changed.
+    # On an internal project that's 8k+ files. Skip if nothing changed.
     from file_state import IndexerCache, files_under
     relevant = list(files_under(
         root,

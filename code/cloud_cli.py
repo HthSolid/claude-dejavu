@@ -4,11 +4,11 @@ Cloud-tier CLI flows: login, logout, status.
 
 `login` runs an OAuth-style device flow:
 
-    plugin                     browser                sofinexus
+    plugin                     browser                license-server
     ──────                     ───────                ─────────
     1. start localhost:N + state token
     2. open https://license.hte.digital/auth?for=dejavu&port=N&state=<...>
-                                ─────►  3. user authenticates (existing sofinexus auth)
+                                ─────►  3. user authenticates (existing the license server)
                                         4. server checks active Pro sub
                                         5. server calls Worker /admin/keys → key
                                         6. server redirects to http://localhost:N/?key=<...>&state=<...>
@@ -20,7 +20,7 @@ Cloud-tier CLI flows: login, logout, status.
 some other means (e.g. an admin-issued onboarding key). Useful for HTE
 internal dogfood + as a fallback when the OAuth landing page is down.
 
-`logout` deletes the local key file and asks sofinexus to revoke server-side.
+`logout` deletes the local key file and asks the license server to revoke server-side.
 
 `status --cloud` shows: current mode, key prefix, worker reachability,
 quota used / remaining, last error.

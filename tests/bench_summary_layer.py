@@ -21,15 +21,28 @@ import os
 import select
 import subprocess
 import time
+from pathlib import Path
 from statistics import median
 
+# Maintainer-local benchmark — see bench_vs_claude_mem.py header
+# for env-override semantics.
 CLAUDE_MEM_MCP = [
     "node",
-    "/home/hendrik/.claude/plugins/cache/thedotmack/claude-mem/10.6.2/scripts/mcp-server.cjs",
+    os.environ.get(
+        "BENCH_CLAUDE_MEM_PATH",
+        str(Path.home() / ".claude" / "plugins" / "cache"
+            / "thedotmack" / "claude-mem" / "10.6.2"
+            / "scripts" / "mcp-server.cjs")),
 ]
 DEJAVU_MCP = [
-    "/home/hendrik/.claude-backups/code/venv/bin/python3",
-    "/home/hendrik/.claude-backups/dist/claude-dejavu/mcp/server.py",
+    os.environ.get(
+        "BENCH_DEJAVU_PYTHON",
+        str(Path.home() / ".local" / "share" / "claude-dejavu"
+            / "venv" / "bin" / "python3")),
+    os.environ.get(
+        "BENCH_DEJAVU_MCP",
+        str(Path(__file__).resolve().parents[1]
+            / "mcp" / "server.py")),
 ]
 
 os.makedirs("/tmp/dejavu-bench-cli", exist_ok=True)
@@ -142,14 +155,14 @@ def main():
         dej_obs_lats, dej_obs_text, dej_obs_hit = [], "", False
         for i in range(REPEATS):
             dt, text = dejavu.call("dejavu_observations",
-                                   {"query": q, "project": "sofi-base-security", "limit": 5})
+                                   {"query": q, "project": "example-project", "limit": 5})
             if i >= WARMUP: dej_obs_lats.append(dt)
             if i == REPEATS - 1: dej_obs_text, dej_obs_hit = text, has_marker(text, markers)
         # dejavu_summary (per project)
         dej_sum_lats, dej_sum_text, dej_sum_hit = [], "", False
         for i in range(REPEATS):
             dt, text = dejavu.call("dejavu_summary",
-                                   {"project": "sofi-base-security", "limit": 1})
+                                   {"project": "example-project", "limit": 1})
             if i >= WARMUP: dej_sum_lats.append(dt)
             if i == REPEATS - 1: dej_sum_text, dej_sum_hit = text, has_marker(text, markers)
 

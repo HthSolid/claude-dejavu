@@ -526,7 +526,7 @@ def _reclaim_stale_named_containers() -> dict[str, Any]:
 # ─── Step 1: data root ───────────────────────────────────────────────────────
 
 def step_data_root(args) -> Path:
-    cyan("[1/6] Data root")
+    cyan("[1/9] Data root")
     root = data_root()
     root.mkdir(parents=True, exist_ok=True)
     (root / "chat-logs").mkdir(exist_ok=True)
@@ -538,7 +538,7 @@ def step_data_root(args) -> Path:
 # ─── Step 2: Postgres ────────────────────────────────────────────────────────
 
 def step_postgres(args, data_dir: Path) -> dict:
-    cyan("[2/6] Postgres")
+    cyan("[2/9] Postgres")
     # Single `global` declaration at the top — Python rejects
     # multiple `global X` lines within the same function, and we
     # have two assignment sites below (the existing detection
@@ -928,7 +928,7 @@ def _apply_schema_migrations(args, host: str, port: str, user: str,
 # ─── Step 3: Weaviate ────────────────────────────────────────────────────────
 
 def step_weaviate(args, data_dir: Path) -> dict:
-    cyan("[3/6] Weaviate")
+    cyan("[3/9] Weaviate")
     detected = None
     for url in ("http://localhost:8889", "http://localhost:8888", "http://localhost:8080", "http://localhost:8081"):
         meta = probe_weaviate(url)
@@ -1056,7 +1056,7 @@ def step_weaviate(args, data_dir: Path) -> dict:
 # ─── Step 4: venv ────────────────────────────────────────────────────────────
 
 def step_venv(args, data_dir: Path) -> Path:
-    cyan("[4/6] Python virtualenv")
+    cyan("[4/9] Python virtualenv")
     venv_dir = data_dir / "venv"
     if not venv_dir.exists():
         cyan(f"    Creating venv at {venv_dir} (one-time, ~5s)…")
@@ -1080,6 +1080,20 @@ def step_venv(args, data_dir: Path) -> Path:
             "(psycopg2-binary, mcp, tree-sitter, tree-sitter-languages, "
             "pyyaml). First-time install can take 30-90s on slow "
             "connections — please wait…")
+    # v0.9.2 — Linuxbrew users get a polluted PATH where Homebrew's
+    # older `ld` shadows the system linker. The Homebrew ld doesn't
+    # understand glibc's `.relr.dyn` relocation type and source-
+    # builds (notably hnswlib) fail with cryptic "unknown type
+    # [0x13] section `.relr.dyn`" errors. Stripping linuxbrew dirs
+    # from PATH for the pip subprocess fixes hnswlib + several
+    # other native-build packages without affecting the user's
+    # normal shell.
+    pip_env = dict(os.environ)
+    if any("linuxbrew" in p for p in pip_env.get("PATH",
+                                                    "").split(":")):
+        pip_env["PATH"] = ":".join(
+            p for p in pip_env.get("PATH", "").split(":")
+            if "linuxbrew" not in p)
     pip_proc = subprocess.Popen(
         [str(pip), "install",
           "psycopg2-binary", "mcp",
@@ -1092,9 +1106,18 @@ def step_venv(args, data_dir: Path) -> Path:
           "tree-sitter==0.21.3", "tree-sitter-languages==1.10.2",
           # PyYAML for parsing OpenAPI/Swagger YAML files in the
           # route indexer (v0.3.2.1+). Falls back to no-op if absent.
-          "pyyaml>=6.0"],
+          "pyyaml>=6.0",
+          # v0.9.1+ — numpy powers the in-process vector index
+          # (brute-force cosine top-k). 27× slower than the v0.9.2
+          # hnswlib path but always available as a fallback.
+          "numpy>=1.24",
+          # v0.9.2 — hnswlib for sub-1ms vector queries.
+          # Best-effort: if the wheel build fails (e.g. polluted
+          # PATH despite our scrub) we fall back to the numpy
+          # brute-force path automatically.
+          "hnswlib>=0.7"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        bufsize=1)
+        bufsize=1, env=pip_env)
     assert pip_proc.stdout is not None
     # Stream pip's per-line output — keeps the user informed during
     # what was previously a silent multi-minute wait. We indent so
@@ -1122,6 +1145,53 @@ def step_venv(args, data_dir: Path) -> Path:
                 f"Common causes: no network, missing C compiler for "
                 f"a wheel that fell back to source build, disk full. "
                 f"Re-run: python scripts/install.py --auto")
+
+    # v0.8.6 Context Economy phase 3 — optional dejavu_bridge wheel.
+    # The wheel is a pre-compiled Rust binary (no readable source)
+    # that supplies the six retrieval primitives (distill / disclose /
+    # gate / retrieve_rrf / sem_cache_lookup / topic_reweight) with
+    # ML-tuned thresholds + Rust speed. Install is best-effort: if
+    # the wheel index URL is unset / unreachable / the wheel isn't
+    # there, claude-dejavu runs in STANDARD MODE — the in-tree
+    # `code/dejavu_bridge_stub.py` provides pure-Python implementations
+    # of the same six primitives. Both modes ship every MCP tool, full
+    # recall, the learned ranker, etc. — only storage efficiency +
+    # latency differ.
+    #
+    # Default URL points at the PUBLIC claude-dejavu repo's release
+    # artifacts. Override with DEJAVU_BRIDGE_INDEX_URL=<file:// or
+    # https:// URL> for a local mirror, a private build, or an
+    # air-gapped install.
+    bridge_url = (os.environ.get("DEJAVU_BRIDGE_INDEX_URL")
+                  or "https://github.com/HthSolid/claude-dejavu/"
+                     "releases/download/dejavu-bridge-0.1.0/")
+    cyan(f"    Attempting optional dejavu_bridge install "
+         f"(binary performance wheel; falls back to the stub if "
+         f"unavailable)…")
+    cyan(f"      Index: {bridge_url}")
+    bridge_rc = subprocess.call(
+        [str(pip), "install", "--quiet",
+         "--find-links", bridge_url,
+         "dejavu_bridge>=0.1.0"],
+        # Don't fail the install if the wheel can't be reached — the
+        # in-tree stub takes over and the user sees a SessionStart
+        # log line explaining standard mode.
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if bridge_rc == 0:
+        green("    ✓ dejavu_bridge wheel installed "
+              "(optimized mode — Rust-speed primitives + compressed "
+              "gists active)")
+    else:
+        # Yellow, not red — standard mode is a fully-supported state.
+        print("    \033[33m⚠\033[0m  dejavu_bridge wheel not "
+              "installed — running in STANDARD MODE (in-tree "
+              "Python stub provides the same six primitives, all "
+              "MCP tools work, recall is unchanged; only "
+              "storage size + hot-path latency are different). "
+              "To switch to optimized mode: set "
+              "DEJAVU_BRIDGE_INDEX_URL to a reachable wheel "
+              "location and re-run install.py.")
+
     green(f"  ✓ venv at {venv_dir}")
     return venv_dir
 
@@ -1129,21 +1199,48 @@ def step_venv(args, data_dir: Path) -> Path:
 # ─── Step 5: config + CLI symlink ────────────────────────────────────────────
 
 def step_config(args, data_dir: Path, pg: dict, wv: dict, venv: Path):
-    cyan("[5/6] Config + CLI")
+    cyan("[5/9] Config + CLI")
     config = data_dir / "config.env"
+
+    # v0.7.1 (bug 8.3 fix): preserve user-set cloud / scope fields from
+    # the existing config.env across reinstalls. Without this, every
+    # reinstall blew away `DEJAVU_EMBED_MODE=cloud` + `DEJAVU_CLOUD_KEY=...`
+    # the user had set via `claude-dejavu login`, silently flipping the
+    # plugin back to local mode.
+    preserved: dict[str, str] = {}
+    if config.is_file():
+        for _line in config.read_text(
+                encoding="utf-8", errors="replace").splitlines():
+            _line = _line.strip()
+            if "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                _k, _v = _k.strip(), _v.strip()
+                if _k in ("DEJAVU_EMBED_MODE", "DEJAVU_CLOUD_KEY",
+                           "DEJAVU_CLOUD_URL",
+                           "CLAUDE_DEJAVU_DEFAULT_SCOPE"):
+                    preserved[_k] = _v
+
     lines = ["# claude-dejavu config — auto-generated by install.py"]
     for k, v in {**pg, **wv}.items():
         lines.append(f"{k}={v}")
     lines.append(f"DATA_ROOT={data_dir}")
     lines.append(f"OS_USER={OS_USER}")
     lines.append(f"SHARED={int(bool(args.shared))}")
-    lines.append("CLAUDE_DEJAVU_DEFAULT_SCOPE=workspace")
+    lines.append(
+        f"CLAUDE_DEJAVU_DEFAULT_SCOPE="
+        f"{preserved.get('CLAUDE_DEJAVU_DEFAULT_SCOPE', 'workspace')}")
     # Cloud embed tier (v0.6.0+). Defaults to local — no behavior change.
     # Users opt in via `claude-dejavu login` (writes mode=cloud + key).
-    lines.append("DEJAVU_EMBED_MODE=local")
-    lines.append("DEJAVU_CLOUD_URL=https://embed.hte.digital")
+    lines.append(
+        f"DEJAVU_EMBED_MODE={preserved.get('DEJAVU_EMBED_MODE', 'local')}")
+    lines.append(
+        f"DEJAVU_CLOUD_URL={preserved.get('DEJAVU_CLOUD_URL', 'https://embed.hte.digital')}")
+    if "DEJAVU_CLOUD_KEY" in preserved:
+        lines.append(f"DEJAVU_CLOUD_KEY={preserved['DEJAVU_CLOUD_KEY']}")
     config.write_text("\n".join(lines) + "\n")
     green(f"  ✓ {config}")
+    for _k, _v in preserved.items():
+        green(f"    ✓ preserved {_k}={_v[:20]}{'…' if len(_v) > 20 else ''}")
 
     # CLI shim — works on all OSes.
     # IMPORTANT: when running with a non-default DATA_ROOT (sandbox / smoke
@@ -1238,6 +1335,77 @@ def step_config(args, data_dir: Path, pg: dict, wv: dict, venv: Path):
 
 # ─── Step 6: MCP registration ────────────────────────────────────────────────
 
+def _du_bytes(path: Path) -> int:
+    """Recursive byte-size of ``path`` (0 if not a directory). Used by
+    the [7/9] post-migration summary; standalone so we don't import
+    session_copy just to read a tree size."""
+    total = 0
+    if not path.is_dir():
+        return 0
+    for dp, _, fns in os.walk(path):
+        for fn in fns:
+            try:
+                total += (Path(dp) / fn).stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _print_post_migration_summary(*, root: Path, home: Path,
+                                       sc,
+                                       auto: bool) -> None:
+    """Surface what migrate-from-rsync actually did so the user knows
+    what disk is reclaimable. v0.8.3 post-release UX polish.
+
+    Prints (when applicable):
+      * restic repo path, snapshot count, on-disk size
+      * each ~/.claude-backups/snapshots.deleteme.<ts> tree size
+      * the reclaim-legacy command to run when ready
+
+    Failures are non-fatal: this is informational only, never errors
+    out the install. Paths are absolute under ``--auto`` so the user
+    can copy-paste into a different shell.
+    """
+    # 1. New restic repo info (snapshot count + size).
+    repo_dir = root / "restic-repo"
+    if sc is not None and repo_dir.is_dir():
+        try:
+            bin_dir = root / "bin"
+            bin_path = bin_dir / "restic"
+            spec = sc.RepoSpec(
+                repo_path=repo_dir,
+                passphrase_file=root / ".restic-pass",
+                bin_path=bin_path if bin_path.exists()
+                           else Path("restic"),
+            )
+            snaps = sc.list_snapshots(spec)
+            repo_size = _du_bytes(repo_dir)
+            print(f"    restic repo: {repo_dir} "
+                   f"({len(snaps)} snapshot"
+                   f"{'' if len(snaps) == 1 else 's'}, "
+                   f"{repo_size / (1024 * 1024):.0f} MB on disk)")
+        except Exception as _exc:
+            yellow(f"    ⚠ could not query restic repo: {_exc}")
+
+    # 2. Legacy tree(s) renamed by step 9 — surface size + reclaim hint.
+    backups = home / ".claude-backups"
+    if backups.is_dir():
+        import re as _re
+        rx = _re.compile(r"^snapshots\.deleteme\.\d+$")
+        renamed: list[tuple[Path, int]] = []
+        for child in sorted(backups.iterdir()):
+            if child.is_dir() and rx.match(child.name):
+                renamed.append((child, _du_bytes(child)))
+        if renamed:
+            for p, sz in renamed:
+                # Absolute path under --auto so copy-paste survives.
+                shown = str(p) if auto else str(p)
+                print(f"    legacy tree renamed: {shown} "
+                       f"({sz / (1024 ** 3):.1f} GB reclaimable)")
+            print(f"    → run `claude-dejavu session-copy "
+                   f"reclaim-legacy` to delete the renamed tree")
+
+
 def _plugin_already_installed() -> bool:
     """Detect a working Claude Code marketplace install of claude-dejavu.
 
@@ -1269,7 +1437,7 @@ def _plugin_already_installed() -> bool:
 
 
 def step_mcp(args, venv: Path):
-    cyan("[6/6] MCP server registration")
+    cyan("[6/9] MCP server registration")
     settings = Path.home() / ".claude" / "settings.json"
 
     # If the plugin is installed via marketplace, the plugin's own .mcp.json
@@ -1487,8 +1655,262 @@ def main():
             yellow(f"  (bootstrap spawn failed: {e}; you can run "
                    f"`{venv_py} {ingester} --bootstrap` manually)")
 
+    # ─── [7/9] Migrate legacy session-copy state (v0.8.0) ───────────────
+    # This is the v0.5/v0.6/v0.7 → v0.8 upgrade path. On a fresh install
+    # with no legacy state we just init the new restic repo. On an
+    # existing install we detect the legacy rsync chain, pause its
+    # timer, and run the 10-step migration (cold mode) — interactive Y/n
+    # without --auto, silent under --auto. See spec §3.10.
+    _progress("session_copy_migrate",
+              "v0.8.0 — restic install + legacy rsync migration if present")
+    try:
+        cyan("[7/9] Migrate legacy session-copy state")
+        sys.path.insert(0, str(PLUGIN_ROOT / "code"))
+        import shutil as _shutil
+        # 7a — ensure restic is on PATH or installed locally.
+        if _shutil.which("restic") is None:
+            try:
+                import install_restic as _ir  # type: ignore[import]
+                bin_dir = root / "bin"
+                # On --auto we accept SHA256-only fallback when gpg is
+                # missing (same posture as --insecure-no-gpg).
+                _allow_fallback = bool(getattr(args, "auto", False))
+                _ir.install_restic(bin_dir=bin_dir,
+                                     allow_fallback=_allow_fallback)
+                green("    ✓ restic installed locally "
+                      f"({bin_dir / 'restic'})")
+            except Exception as _exc:
+                yellow(f"    ⚠ restic install failed: {_exc} — "
+                       f"session-copy will be unavailable until you "
+                       f"install restic manually")
+        else:
+            green("    ✓ restic already on PATH")
+
+        # 7a-bis — install the v0.8.2 dejavu-rescue Go binary.
+        # Same bin dir as restic; same idempotency pattern. v0.8.2 is
+        # local-build only (requires Go ≥ 1.21 on PATH); when Go is
+        # missing we warn and continue so the rest of the install path
+        # still completes.
+        try:
+            import install_rescue as _irr  # type: ignore[import]
+            _ir_bin_dir = root / "bin"
+            _rescue_path = _irr.install_rescue_binary(bin_dir=_ir_bin_dir)
+            green(f"    ✓ dejavu-rescue installed locally "
+                   f"({_rescue_path})")
+        except Exception as _exc:
+            yellow(f"    ⚠ dejavu-rescue install skipped: {_exc} — "
+                   f"`claude-dejavu rescue-shard` will be unavailable "
+                   f"until Go is installed and scripts/install.py is "
+                   f"re-run")
+
+        # 7b — detect legacy state + decide migrate vs fresh init.
+        try:
+            import migrate_rsync as _mr  # type: ignore[import]
+            import scheduling as _sched  # type: ignore[import]
+            import session_copy as _sc  # type: ignore[import]
+        except ImportError as _exc:
+            yellow(f"    ⚠ session-copy modules unavailable: {_exc}")
+            _mr = None  # type: ignore[assignment]
+            _sched = None  # type: ignore[assignment]
+            _sc = None  # type: ignore[assignment]
+        if _mr is not None:
+            try:
+                _is_legacy = _mr.detect_legacy_state(
+                    home=Path.home(), data_root=root)
+            except Exception as _exc:
+                yellow(f"    ⚠ detect_legacy_state crashed: {_exc}")
+                _is_legacy = False
+
+            if _is_legacy:
+                cyan("    Detected legacy rsync session-copy chain.")
+                # Stop the bleeding: best-effort disable of the legacy
+                # "claude-backup" scheduler (NOT the new session-copy one).
+                if _sched is not None:
+                    try:
+                        # The legacy unit name is "claude-backup"; our
+                        # scheduling.disable_scheduler() targets the v0.8
+                        # unit. We invoke systemctl directly here for the
+                        # legacy name as a best-effort cleanup.
+                        if sys.platform.startswith("linux"):
+                            subprocess.run(
+                                ["systemctl", "--user", "disable", "--now",
+                                  "claude-backup.timer"],
+                                check=False, capture_output=True,
+                                timeout=10)
+                    except Exception:
+                        pass
+
+                # Spec §3.10.2 — interactive Y/n prompt OR silent under
+                # --auto. Both paths run migrate_rsync.run(mode='cold').
+                _do_migrate = True
+                if not getattr(args, "auto", False):
+                    print("    ┌────────────────────────────────────────")
+                    print("    │  Migration ETA: ~30-60 minutes (resumable)")
+                    print("    │  Press Enter to start, or 'n' to defer.")
+                    print("    └────────────────────────────────────────")
+                    try:
+                        _reply = input("    [Y/n] ").strip().lower()
+                    except EOFError:
+                        _reply = ""
+                    if _reply == "n":
+                        _do_migrate = False
+                        yellow("    Deferred. Run "
+                               "`claude-dejavu session-copy "
+                               "migrate-from-rsync` when ready.")
+                if _do_migrate:
+                    try:
+                        _rc = _mr.run(mode="cold",
+                                        yes=args.auto,
+                                        data_root=root)
+                        if _rc == 0:
+                            green("    ✓ migration complete")
+                            # v0.8.3 post-release polish: surface
+                            # what actually happened so the user
+                            # knows how much disk they can reclaim.
+                            try:
+                                _print_post_migration_summary(
+                                    root=root,
+                                    home=Path.home(),
+                                    sc=_sc,
+                                    auto=bool(getattr(args, "auto", False)))
+                            except Exception as _exc:  # pragma: no cover
+                                yellow(f"    ⚠ post-migration summary "
+                                       f"skipped: {_exc}")
+                        else:
+                            yellow(f"    ⚠ migration exited {_rc} — "
+                                   f"phase marker preserved for resume")
+                    except Exception as _exc:
+                        yellow(f"    ⚠ migration crashed: {_exc} — "
+                               f"phase marker preserved for resume")
+            else:
+                # No legacy state. Fresh install path: if no restic repo
+                # at $DATA_ROOT/restic-repo/, init it now. Spec §3.10.5.
+                if _sc is not None and not (root / "restic-repo").is_dir():
+                    try:
+                        bin_dir = root / "bin"
+                        bin_path = bin_dir / "restic"
+                        spec = _sc.RepoSpec(
+                            repo_path=root / "restic-repo",
+                            passphrase_file=root / ".restic-pass",
+                            bin_path=bin_path if bin_path.exists()
+                                       else Path("restic"),
+                        )
+                        # In --auto mode we skip the typed-confirm so
+                        # install completes hands-off; users can rotate
+                        # the passphrase later. Print it always.
+                        _sc.init_repo(
+                            spec,
+                            prompt_passphrase=not bool(
+                                getattr(args, "auto", False)))
+                        green("    ✓ fresh restic repo initialized at "
+                              f"{root / 'restic-repo'}")
+                    except Exception as _exc:
+                        yellow(f"    ⚠ session-copy init failed: {_exc} "
+                               f"— run `claude-dejavu session-copy init` "
+                               f"manually to retry")
+                elif (root / "restic-repo").is_dir():
+                    cyan("    (restic repo already initialized)")
+
+        # v0.8.3 — if the recorded installed-version.json is < 0.8.3,
+        # print the one-liner reminder for the new --include all
+        # comprehensive snapshot that now also covers PG + Weaviate.
+        try:
+            ver_path = root / "installed-version.json"
+            prev_ver = ""
+            if ver_path.is_file():
+                try:
+                    prev_ver = (json.loads(ver_path.read_text(
+                        encoding="utf-8")) or {}).get("version", "")
+                except Exception:
+                    prev_ver = ""
+            def _tuple(s: str) -> tuple[int, ...]:
+                parts = [p for p in (s or "").split(".") if p.isdigit()]
+                return tuple(int(p) for p in parts) or (0,)
+            if _tuple(prev_ver) < (0, 8, 3):
+                cyan(
+                    "    v0.8.3 adds backup of PG + Weaviate to "
+                    "session-copy. Run:")
+                cyan(
+                    "      claude-dejavu session-copy take "
+                    "--include all")
+                cyan(
+                    "    for the first comprehensive snapshot.")
+        except Exception:
+            pass
+    except Exception as _exc:
+        yellow(f"    ⚠ [7/9] step crashed unexpectedly: {_exc}")
+
+    # Seed docs embedding once at install time. Non-fatal: if Weaviate
+    # isn't reachable, the Stop hook will catch up on the next session.
+    try:
+        cyan("[8/9] Seed documentation embeddings")
+        import subprocess as _sp
+        # v0.7.1 (bug 8.1 fix): forward config.env to the subprocess so
+        # `recall.py reindex --docs` sees the just-written WV_URL / PG_*
+        # values. Previously the subprocess inherited install.py's own
+        # env (which never set WV_URL), semantic_search.is_available()
+        # probed localhost:8080 (unreachable), reindex returned 2, and
+        # this step silently reported green while embedding nothing.
+        _cfg_env = dict(os.environ)
+        _cfg_path = root / "config.env"
+        if _cfg_path.is_file():
+            for _line in _cfg_path.read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _k, _v = _line.split("=", 1)
+                _cfg_env[_k.strip()] = _v.strip()
+        _result = _sp.run(
+            [sys.executable, str(PLUGIN_ROOT / "code" / "recall.py"),
+              "reindex", "--docs"],
+            timeout=300, capture_output=True, text=True, env=_cfg_env,
+        )
+        if _result.returncode == 0:
+            green("    ✓ docs seeded (or already up-to-date)")
+        else:
+            yellow(f"    ⚠ docs seed exited {_result.returncode} — "
+                      f"run `claude-dejavu reindex --docs` to retry, or "
+                      f"the Stop hook will catch up next session")
+    except Exception as e:
+        yellow(f"    ⚠ docs seed skipped: {e} — "
+                  f"run `claude-dejavu reindex --docs` to retry, or "
+                  f"the Stop hook will catch up next session")
+
+    # Phase E v0.7 backfill: tag existing ClaudeDejavuCode rows with
+    # their repo_id. Non-fatal: install still succeeds even if this fails.
+    try:
+        cyan("[9/9] Backfill ClaudeDejavuCode.repo_id")
+        sys.path.insert(0, str(PLUGIN_ROOT / "code"))
+        from semantic_search import backfill_repo_ids_into_code as _bf
+        report = _bf()
+        if report.get("tagged", 0):
+            green(f"    ✓ backfilled repo_id on {report['tagged']} code rows")
+        if report.get("failed", 0):
+            yellow(f"    ⚠ {report['failed']} PATCH call(s) failed — "
+                      f"run `dejavu doctor` for details")
+        if report.get("orphan_slugs"):
+            yellow(f"    ⚠ {len(report['orphan_slugs'])} legacy slug(s) "
+                      f"could not be mapped — run `dejavu doctor` for details")
+        if not (report.get("tagged") or report.get("failed") or report.get("orphan_slugs")):
+            cyan(f"    (nothing to backfill — fresh install or already done)")
+    except Exception as e:
+        yellow(f"    ⚠ repo_id backfill skipped: {e}")
+
     # Success: clear any stale incomplete marker.
     _clear_install_status()
+
+    # v0.8.0 — record the installed version so the next install.py [7/9]
+    # step can detect upgrades from < 0.8.0 even after legacy artifacts
+    # have been migrated away.
+    try:
+        ver_path = root / "installed-version.json"
+        ver_path.write_text(json.dumps({
+            "version": "0.8.13",
+            "installed_at": int(__import__("time").time()),
+        }, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
     print()
     green("Installation complete.")

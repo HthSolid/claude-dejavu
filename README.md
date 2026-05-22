@@ -217,18 +217,47 @@ All hooks, the MCP server, and the CLI are pure Python.
 
 ### Slash commands available after install
 
+**Search + recovery**
+
 | Command | What it does |
 |---|---|
-| `/dejavu-search <query>` | Hybrid (BM25 + vector) search across past sessions |
+| `/dejavu-search <query>` | Hybrid (BM25 + vector) search across past sessions — gist-first response shape (v0.8.6) |
 | `/dejavu-resume <hint>` | Find the best matching past session + ready-to-run resume command |
 | `/dejavu-sessions` | List recent sessions in current scope |
 | `/dejavu-restore` | List/restore deleted sessions from off-tree backup |
+| `/dejavu-repair` | Detect + reconstruct corrupt / truncated session JSONLs from the dejavu DB (v0.7.1) |
+| `/dejavu-scan-corruption` | Detect zeroed / partial-zero / shrunk files across known projects (v0.7.2) |
+| `/dejavu-recover-file` | Reconstruct a corrupted file from a file-history snapshot + Edit replay (v0.7.2) |
+
+**Backup + rescue**
+
+| Command | What it does |
+|---|---|
+| `/dejavu-session-copy` | Restic-backed session-copy: take, list, diff, restore, prune, migrate-from-rsync, reclaim-legacy (v0.8.0 + v0.8.3) |
+| `/dejavu-rescue` | Recover records from a corrupted Weaviate shard via the pure-stdlib Go segment reader (v0.8.2) |
+| `/dejavu-pg-rescue` | Postgres corruption rescue toolkit: scan, patch-toast, reset-flags, rebuild-table, reindex (v0.8.3) |
+| `/dejavu-weaviate-rescue` | Weaviate rescue toolkit: scan, quarantine-segment, redo-class (v0.8.3) |
+
+**Grounding + introspection**
+
+| Command | What it does |
+|---|---|
 | `/dejavu-symbols <name>` | Resolve a code symbol against the project's index |
 | `/dejavu-lint <file>` | Lint a proposed edit, flag fabricated names + typos |
-| `/dejavu-reindex` | (Re)build the symbol index for the current project |
+| `/dejavu-reindex` | (Re)build the symbol + doc + route indexes for the current project |
+| `/dejavu-docs <query>` | Heading-anchored `.md` chunk search across the repo's docs (v0.7.0) |
 | `/dejavu-outcomes` | Inspect the correction_outcomes log |
-| `/dejavu-doctor` | Diagnose install + runtime health |
+| `/dejavu-doctor` | Diagnose install + runtime health (`--deep` for full PG + WV scan, v0.8.3) |
 | `/dejavu-config` | Read/change settings (lint mode, scope defaults, …) |
+
+**Context economy** (v0.8.4 → v0.8.6)
+
+| Command | What it does |
+|---|---|
+| `/dejavu-what-shipped` | Print the last N CHANGELOG release headlines for a repo (v0.8.4) |
+| `/dejavu-memory` | `record-version` for the cross-project release digest; `backfill-gists` to populate compressed gists (v0.8.4 + v0.8.6) |
+| `/dejavu-jit-recall-preview` | Preview what the opt-in JIT recall hook would inject for a given prompt (v0.8.5) |
+| `/dejavu-expand` | Fetch the full content of one or more turns by id — companion to the gist-first search shape (v0.8.6) |
 
 > **Install or runtime trouble?** See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 > for common errors (Docker not running, port conflicts, stale install
@@ -238,33 +267,87 @@ All hooks, the MCP server, and the CLI are pure Python.
 
 ---
 
+## Dependencies
+
+### Required (open source)
+
+Installed automatically by `scripts/install.py` into the dejavu-owned
+venv: `psycopg2-binary`, `mcp`, `tree-sitter`, `tree-sitter-languages`,
+`pyyaml`.
+
+### Optional: `dejavu_bridge` (binary performance wheel)
+
+Starting in **v0.8.6** (Context Economy phase 3) claude-dejavu can
+use the `dejavu_bridge` Python wheel — a pre-compiled Rust binary
+that ships six retrieval primitives (gist compression, token-budget
+retrieval, semantic cache lookup, RRF fusion, ingest gate, topic
+re-rank). The wheel is **a performance addon, not a core feature**.
+
+| Mode | dejavu_bridge present? | What's different |
+|---|:---:|---|
+| **Optimized** | yes | Compressed gists (less disk + faster recall), ML-tuned thresholds, Rust-speed (10-30× sub-ms wins on hot paths) |
+| **Standard** | no | Pure-Python implementation of the same six primitives via `code/dejavu_bridge_stub.py`. All MCP tools, recall, ranking, and bench numbers are unchanged. Storage uses more disk (gists = raw content), some hot paths run a few ms slower. |
+
+Both modes ship every MCP tool, the full search surface, vector
+indexes, learned ranker, etc. The bench corpus has been running at
+8/8 across all three dejavu tools throughout development in standard
+mode. Switching to optimized mode is purely a "make it faster /
+smaller" move, not a "unlock features" one.
+
+**Install path.** By default the installer attempts to fetch the
+binary wheel from the public release artifacts of the claude-dejavu
+repo. Override via `DEJAVU_BRIDGE_INDEX_URL` for a local mirror,
+your own build, or a custom CDN:
+
+```bash
+# example: install from a local artifact directory
+export DEJAVU_BRIDGE_INDEX_URL=file:///path/to/wheels/
+python3 scripts/install.py --auto
+```
+
+If the wheel can't be fetched, install proceeds in **standard mode**
+— the in-tree stub takes over automatically. SessionStart announces
+the active mode in stderr; check with `claude-dejavu doctor`.
+
+---
+
 ## How it works
 
 ```
-                   ┌─────────────────────────────┐
-   Claude Code ─►  │  Stop hook (pure Python)    │
-   .jsonl write    │                             │
-                   │  • mirror to off-tree dir   │  ← always (free safety net)
-                   │  • incremental ingest       │  ← async (PG + Weaviate)
-                   │  • throttled snapshot 5min  │  ← rsync --link-dest
-                   │  • deletion-detection       │  ← warn user via systemMessage
-                   └────────────┬────────────────┘
+                   ┌──────────────────────────────────┐
+   Claude Code ─►  │  Stop hook (pure Python)         │
+   .jsonl write    │                                  │
+                   │  • mirror to off-tree dir        │  ← always (free safety net)
+                   │  • incremental ingest            │  ← async (PG + Weaviate)
+                   │  • restic snapshot (scheduled)   │  ← content-addressed dedup, v0.8.0+
+                   │  • deletion-detection            │  ← warn user via systemMessage
+                   └────────────┬─────────────────────┘
                                 │
         ┌───────────────────────┴────────────────────────┐
         │                                                │
    ┌────▼──────────┐    Postgres                  Weaviate
-   │ sessions      │    • per-user isolation     • text2vec-transformers
-   │ turns         │    • trigram + BM25 + FTS   • multi-tenant per Linux user
-   │ tool_calls    │    • workspaces table       • hybrid BM25 + vector
+   │ sessions      │    • per-user isolation     • caller-supplied 1024-dim
+   │ turns         │    • trigram + BM25 + FTS   │   (cloud embed; vectorizer:none)
+   │ turns.gist    │    • workspaces table       • multi-tenant per Linux user
+   │ tool_calls    │    • code symbols           • BM25 keyword + vector ANN
    │ file_touches  │
+   │ symbols       │
    └───────────────┘
                                 │
                                 ▼
-                ┌──────────────────────────────────┐
-                │  CLI + MCP server                │
-                │  hybrid query, two-pass design   │
-                │  scope = workspace ⊇ project     │
-                └──────────────────────────────────┘
+                ┌──────────────────────────────────────────┐
+                │  CLI + MCP server + UserPromptSubmit hook │
+                │  BM25 + RRF fusion + token-budget greedy │
+                │  scope = workspace ⊇ project             │
+                │  gist-first response (--full for raw)    │
+                └──────────────────────────────────────────┘
+
+Backup layer (since v0.8.0):
+  • restic repo at $DATA_ROOT/restic-repo/   (content-addressed; ~5-10 GB for 90 days
+                                              vs the 500 GB the old rsync chain ate)
+  • session-copy take/restore/check/prune    (CLI)
+  • optional --include=pg+weaviate (v0.8.3)  (pg_dump + Weaviate volume tar)
+  • optional reclaim-legacy (v0.8.3)         (drop the migrate-from-rsync .deleteme tree)
 ```
 
 ### Storage layout

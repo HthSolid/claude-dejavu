@@ -23,11 +23,30 @@ docker compose -f docker/docker-compose.minimal.yml up -d
 python3 scripts/install.py
 
 # Run tests
-python3 tests/run_all.py    # infra-free assertions (~168 tests)
+python3 tests/run_all.py    # infra-free assertions (~1055 tests as of v0.8.8)
 python3 tests/smoke.py       # full smoke (~175 steps, requires PG + Weaviate)
+
+# Install the pre-push hook (one-time per clone)
+./scripts/install-hooks.sh
 ```
 
 See [docs/INSTALL.md](docs/INSTALL.md) for the full installer flow.
+
+## Local CI / pre-push gate
+
+After running `./scripts/install-hooks.sh`, every `git push` first
+runs `./scripts/local-ci.sh fast` and refuses the push if it fails.
+The fast pass (`tests/run_all.py` + `compileall`) takes ~20s; the
+full pass (`HTE_FULL_LOCAL_CI=1 git push`) adds the bridge-parity
+probe on top, ~21s. Emergency bypass: `HTE_SKIP_LOCAL_CI=1 git push`
+(logged to stderr).
+
+Why it exists: silent-failure bugs (e.g. a method called with the
+wrong kwarg that gets caught by `try/except: pass`, then unit tests
+mock that path and don't notice) shipped twice during the v0.8.7-
+v0.8.8 release pair. The local-CI gate plus the `tests/test_bridge_
+signature_parity.py` regression net catches that whole bug class
+before the push lands on `origin/main`.
 
 ## Pull request guidelines
 

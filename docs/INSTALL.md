@@ -302,28 +302,135 @@ in chat to launch it.
 
 ## What the installer actually does (so you trust it)
 
-When you press `a` for auto-provision, `scripts/install.py`:
+When you press `a` for auto-provision, `scripts/install.py` runs nine
+labelled steps. Re-running is idempotent — each step skips if its
+prerequisite is already satisfied.
 
-1. **Creates** `~/.local/share/claude-dejavu/` (or platform-equivalent) for
-   off-tree backups + config + venv.
-2. **Spins up** the bundled `docker-compose.minimal.yml` stack:
-   - `claude-dejavu-postgres` (postgres:16) on port 5454
-   - `claude-dejavu-weaviate` (semitechnologies/weaviate:1.27.5) on port 8889
-   - `claude-dejavu-transformers` (sentence-transformers/all-MiniLM-L6-v2)
-3. **Creates** the `claude_dejavu_<your-username>` database + applies the schema.
-4. **Creates** the `ClaudeDejavuTurn` Weaviate class with text2vec-transformers.
-5. **Creates** a Python virtualenv at `~/.local/share/claude-dejavu/venv/` and
-   installs `psycopg2-binary` + `mcp` (the Anthropic MCP SDK).
-6. **Symlinks** the `claude-dejavu` CLI into `~/.local/bin/` (or
-   `%LOCALAPPDATA%\Microsoft\WindowsApps\` on Windows).
-7. **Registers** the MCP server in your `~/.claude/settings.json` (with a
-   `.bak` backup of the original).
-8. **Wires** the Stop hook so future sessions get mirrored + ingested
-   automatically.
+- **`[1/9] Data root`** — creates `~/.local/share/claude-dejavu/` (or
+  the platform-equivalent `LOCALAPPDATA` / `Application Support`
+  directory) for off-tree backups + config + venv.
+- **`[2/9] Postgres`** — detects an existing `claude-dejavu-postgres`
+  container or spins up `postgres:16` on port 5454 via the bundled
+  `docker-compose.minimal.yml`. Creates the
+  `claude_dejavu_<your-username>` database and applies the schema.
+- **`[3/9] Weaviate`** — same shape: `semitechnologies/weaviate:1.27.5`
+  on port 8889 plus the matching `transformers-inference` container.
+  Creates the `ClaudeDejavuTurn` class.
+- **`[4/9] Python virtualenv`** — creates the venv at
+  `~/.local/share/claude-dejavu/venv/` and installs `psycopg2-binary`,
+  `mcp`, `tree-sitter`, `tree-sitter-languages`, `pyyaml`. **Also
+  attempts to install the optional `dejavu_bridge` wheel** (v0.8.6 —
+  see below) via
+  `pip install --find-links $DEJAVU_BRIDGE_INDEX_URL dejavu_bridge>=0.1.0`.
+  Falls back to the in-tree stub silently if the wheel isn't reachable.
+- **`[5/9] Config + CLI`** — writes `config.env`, symlinks the
+  `claude-dejavu` CLI into `~/.local/bin/` (or
+  `%LOCALAPPDATA%\Microsoft\WindowsApps\` on Windows).
+- **`[6/9] MCP server registration`** — registers `claude-dejavu` in
+  your `~/.claude/settings.json` (with a `.bak` backup of the
+  original).
+- **`[7/9] Migrate legacy session-copy state`** (v0.8.0+) — auto-detects
+  legacy rsync chains (`~/.claude-backups/snapshots/`,
+  `claude-backup.timer`, etc.) and runs the 10-step `migrate-from-rsync`
+  interactively (or silently under `--auto`). Also installs `restic`
+  locally (cross-platform, no sudo) via `code/install_restic.py` and
+  the rescue Go binary via `code/install_rescue.py`. Phase-marker
+  resume after crashes; per-step rollback contracts.
+- **`[8/9] Seed documentation embeddings`** — embeds every `.md` under
+  the current repo into the `ClaudeDejavuDoc` Weaviate class so
+  `dejavu_search(kinds=["doc"])` works on day one.
+- **`[9/9] Backfill ClaudeDejavuCode.repo_id`** — back-tags any
+  pre-v0.7 `ClaudeDejavuCode` objects with the resolved stable
+  `repo_id`. Non-fatal — install never aborts on backfill failure.
 
 **Nothing critical lives in your project directory.** All state is off-tree
 under `~/.local/share/claude-dejavu/`. You can `git clean -xfd` your project
 freely; claude-dejavu's data survives.
+
+### `restic` install + GPG signature pinning (v0.8.0+)
+
+Step `[7/9]` also installs `restic` (≥ 0.17.0; pinned 0.17.3) locally
+into the dejavu data root without sudo. The installer:
+
+1. Downloads the pinned release artifact + SHA256.
+2. Verifies the signature against the pinned maintainer fingerprint
+   (`BD3F7A907` last 10 hex). The pubkey is fetched from a fallback
+   chain: `keys.openpgp.org` → `keyserver.ubuntu.com` → `pgp.mit.edu`
+   (v0.8.3 fix — `keys.openpgp.org` doesn't host the restic
+   maintainer's pubkey, so the v0.8.0 ship was broken on every fresh
+   install).
+3. Falls back to SHA256-only under `--auto` if `gpg` is missing or all
+   keyservers are unreachable. **Signature-fingerprint mismatches
+   always fail** (security-critical).
+
+Cross-platform: clears macOS Gatekeeper quarantine, runs `Unblock-File`
+on Windows.
+
+### `dejavu_bridge` (closed-source binary wheel, v0.8.6)
+
+claude-dejavu v0.8.6 can use the `dejavu_bridge` Python wheel for
+compressed gist generation, anchor-preserving distill, and
+token-budget-aware JIT recall. The wheel ships pre-compiled binary
+code from the closed-source `dejavu` project (private repo, not
+redistributable except as the published wheel artifacts).
+
+**If the wheel is unavailable at install time, claude-dejavu runs in
+STANDARD MODE** — `code/dejavu_bridge_stub.py` activates and
+re-exposes the same six primitives with naive deterministic Python.
+The whole test suite passes against the stub; recall keeps working.
+What you lose: gist quality drops to "first-paragraph-ish" and
+JIT recall falls back to fixed top-N truncation instead of greedy
+token-budget fill.
+
+To install the wheel, point `DEJAVU_BRIDGE_INDEX_URL` at a directory or
+URL containing the wheel artifacts before running the installer:
+
+```bash
+export DEJAVU_BRIDGE_INDEX_URL=file:///path/to/wheels/
+python3 scripts/install.py --auto
+```
+
+SessionStart logs which mode is active on every fresh session. Re-check
+with `claude-dejavu doctor`.
+
+### Post-install: opt-in features
+
+These are off by default — flip them on in
+`<DATA_ROOT>/config.env` when you want them.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `JIT_RECALL_ENABLED` | `false` | Master switch for the UserPromptSubmit JIT recall hook. When `true`, every user prompt fans out to a BM25 keyword search against past sessions and the top hits' gists get injected as additional context. Defensive-by-design — every failure mode exits 0 silently. |
+| `JIT_RECALL_TOP_N` | `3` | Hits to inject (legacy v0.8.5 path; v0.8.6+ uses greedy fill instead). |
+| `JIT_RECALL_TOKEN_CAP` | `500` | chars/4 budget for v0.8.6 `dejavu_bridge.disclose` greedy fill. |
+| `JIT_RECALL_SCORE_THRESHOLD` | `2.0` | Silence floor on BM25 (range 1-20+, NOT 0-1 cosine — `2.0` is the retuned default; `0.6` from v0.8.5 silently rejected every real hit). |
+| `JIT_RECALL_MIN_PROMPT_CHARS` | `40` | Skip short prompts (typo, "ok", "hm"). |
+| `INJECT_SESSION_START` | `true` | Set `false` to disable the SessionStart preamble + the cross-project release digest. |
+
+Preview what the hook would inject before flipping it on:
+
+```bash
+claude-dejavu jit-recall-preview "your typical prompt here"
+```
+
+### Post-install: legacy `.deleteme` tree (v0.8.3)
+
+If you upgraded from v0.5 / v0.6 / v0.7 / pre-v0.8.0, the
+`migrate-from-rsync` step renamed your old
+`~/.claude-backups/snapshots/` chain to
+`~/.claude-backups/snapshots.deleteme.<unix-ts>/` and left it on disk
+as a safety net. The `[7/9]` summary reports its size + the
+`reclaim-legacy` command. Once you've verified the new restic repo
+has everything you need, reclaim it:
+
+```bash
+claude-dejavu session-copy reclaim-legacy --dry-run
+claude-dejavu session-copy reclaim-legacy --yes
+```
+
+The 2026-05-15 incident left a 513 GB legacy tree on one host; running
+`reclaim-legacy` after verifying the restic repo brought that back to
+the ~5-10 GB the new policy targets.
 
 ---
 
@@ -380,7 +487,9 @@ PG_HOST=localhost PG_PORT=5454 PG_USER=postgres PG_PASS=postgres \
   python3 tests/smoke.py
 ```
 
-Expected smoke output: `PASS: 52     FAIL: 0     OK` (as of v0.3.3).
+Expected smoke output: `PASS: NNN     FAIL: 0     OK`. The full suite
+(`tests/run_all.py`) reports **926 / 0** as of v0.8.6 (was 858 in v0.8.5,
+808 in v0.8.4, 714 in v0.8.3).
 
 In Claude Code, the same diagnostics are available as slash commands:
 `/dejavu-doctor`, `/dejavu-config list`, `/dejavu-sessions`.

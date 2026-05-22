@@ -1,0 +1,13 @@
+[Unit]
+Description=claude-dejavu session-copy (restic-backed snapshot) one-shot
+Documentation=https://github.com/HthSolid/claude-dejavu
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=${BIN_PATH} session-copy take --tag timer
+
+[Install]
+WantedBy=default.target

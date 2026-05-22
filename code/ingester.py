@@ -59,7 +59,39 @@ PG_DSN = (f"host={_CFG.get('PG_HOST','localhost')} port={_CFG.get('PG_PORT','545
           f"user={_CFG.get('PG_USER','postgres')} password={_CFG.get('PG_PASS','postgres')} "
           f"dbname={_PG_DB}")
 WEAVIATE_URL = _CFG.get("WV_URL", "http://localhost:8888")
-WEAVIATE_CLASS = "ClaudeDejavuTurn"
+# v0.8.12: honor CLAUDE_DEJAVU_WV_CLASS / WV_CLASS overrides so the bench
+# corpus can ingest into a dedicated `ClaudeDejavuTurn_bench` class without
+# polluting the live `ClaudeDejavuTurn` class. recall.py already honors
+# the same env var (see code/recall.py:59). Default unchanged.
+WEAVIATE_CLASS = (
+    os.environ.get("CLAUDE_DEJAVU_WV_CLASS")
+    or _CFG.get("WV_CLASS")
+    or "ClaudeDejavuTurn"
+)
+
+# v0.8.15 — defense in depth for the bench-isolation contract: warn
+# (loudly, once per slug) if a `-bench` project would route vectors
+# into a non-bench Weaviate class. Catches the failure mode that
+# v0.8.12 was built to prevent — bench fixture leaking into live.
+_BENCH_SLUG_WARNED: set[str] = set()
+
+
+def _warn_if_bench_misroute(slug: str) -> None:
+    if not slug or not slug.endswith("-bench"):
+        return
+    if WEAVIATE_CLASS.endswith("_bench"):
+        return
+    if slug in _BENCH_SLUG_WARNED:
+        return
+    _BENCH_SLUG_WARNED.add(slug)
+    print(
+        f"\n!!! WARNING: project_slug='{slug}' (bench fixture) "
+        f"is routing vectors into Weaviate class "
+        f"'{WEAVIATE_CLASS}' (not _bench). Set "
+        f"CLAUDE_DEJAVU_WV_CLASS=<something>_bench to isolate, "
+        f"or your live ClaudeDejavuTurn class WILL be polluted.\n",
+        file=sys.stderr, flush=True,
+    )
 
 # Cloud embed mode (DEJAVU_EMBED_MODE=cloud) routes vectorization through
 # the dejavu-cloud managed embedder. When active, every batch upsert
@@ -82,24 +114,72 @@ WEAVIATE_TIMEOUT = 600
 # Local imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    # `rule_gist` is the deterministic, no-I/O, no-LLM path. We use it
-    # directly during ingest because the hybrid `make_gist` will reach
-    # out to Ollama on long assistant turns even with prefer_llm=False
-    # (line 148 of gist.py: text>=1000 + assistant + text → use_llm).
-    # That LLM call has a 30s urllib timeout — for a 32 MB session
-    # with thousands of long assistant turns, ingest blocks for tens
-    # of minutes per session waiting on Ollama.
-    #
-    # Ingest needs to be fast and deterministic. If a higher-quality
-    # gist is ever desired, it should be computed on-demand at search
-    # time, not during ingest of historical sessions.
-    from gist import rule_gist as _rule_gist
+    # v0.8.6 (Context Economy phase 3): route gist computation through
+    # `distill_pipeline`, which wraps the closed-source `dejavu_bridge`
+    # wheel (or the in-tree stub when the wheel is missing). The
+    # pipeline preserves load-bearing tokens (paths, ports, env vars,
+    # error class names, version strings, flags) and skips
+    # uncompressible content (code blocks, tracebacks, JSON, diffs).
+    # Returns (None, None) for skip-types so the caller stores
+    # gist=NULL and recall falls back to content[:200].
+    from distill_pipeline import make_gist as _distill_make_gist
+    from distill_pipeline import _bridge as _bridge_mod  # noqa: F401
 
     def make_gist(text, role=None, content_type=None, prefer_llm=False):
-        return _rule_gist(text), "rule"
+        # `prefer_llm` retained for legacy callers; ignored — the
+        # pipeline decides whether to invoke the bridge.
+        return _distill_make_gist(text, role=role, content_type=content_type)
 except Exception:
+    # Belt-and-suspenders fallback: even the stub import shouldn't
+    # fail, but if something deeper breaks (PYTHONPATH munged, etc.),
+    # legacy first-80-chars behaviour keeps ingest moving.
     def make_gist(text, role=None, content_type=None, prefer_llm=False):
         return text[:80], "rule"
+
+    _bridge_mod = None  # type: ignore[assignment]
+
+
+# v0.8.7 (Context Economy phase 4): trash-input gate. Bridge primitive
+# `gate(text) -> bool` returns True if a turn is worth embedding under
+# the spec defaults (>= 50 chars, >= 30% alphanumeric). Skipping
+# low-signal turns BEFORE the cloud-embed roundtrip saves quota +
+# clutter; gate-rejected rows just stay `vectorized=FALSE` (no schema
+# change). On bridge import failure we fall through to "accept all",
+# matching v0.8.6 behaviour exactly so nobody regresses.
+
+# Module-level counter for `_gate_emit_summary` to log at end of ingest.
+_GATE_COUNTERS: dict[str, int] = {"accepted": 0, "rejected": 0}
+
+
+def _gate_ok(text: str) -> bool:
+    """Bridge-gated trash check. Returns True if the text passes the
+    bridge's `gate` (i.e., is worth embedding). Bumps the appropriate
+    counter so the caller's end-of-ingest log can surface skip totals.
+    Any exception (broken wheel, malformed text) falls through to
+    True — never let a wheel bug suppress real content.
+    """
+    try:
+        if _bridge_mod is None:
+            _GATE_COUNTERS["accepted"] += 1
+            return True
+        ok = bool(_bridge_mod.gate(text or ""))
+    except Exception:
+        # Defensive: bridge raised — accept the turn. We'd rather
+        # waste an embed call than lose a real turn to a wheel
+        # regression.
+        _GATE_COUNTERS["accepted"] += 1
+        return True
+    if ok:
+        _GATE_COUNTERS["accepted"] += 1
+    else:
+        _GATE_COUNTERS["rejected"] += 1
+    return ok
+
+
+def _gate_reset() -> None:
+    """Test hook: zero the counters."""
+    _GATE_COUNTERS["accepted"] = 0
+    _GATE_COUNTERS["rejected"] = 0
 
 
 def decode_project_path(encoded: str) -> str:
@@ -360,11 +440,55 @@ def _progress_emit(session_uuid: str, line_no: int, file_size: int,
           file=sys.stderr, flush=True)
 
 
+def _should_skip_repaired(jsonl_path) -> bool:
+    """Return True if ``jsonl_path`` has a fresh ``.dejavu-repair-fingerprint``
+    sidecar (meaning we just reconstructed it from the DB and re-ingesting
+    would create duplicate ``turns`` rows via line_no-based idx).
+
+    Spec section 7.1 (idx-collision avoidance): the repair command writes
+    the fingerprint at ``<live_stem>.dejavu-repair-fingerprint`` after a
+    successful write. Claude Code's first session-resume bumps the file's
+    mtime past the fingerprint (>5s slack for filesystem clock skew), at
+    which point we clear the stale fingerprint and allow normal ingest.
+    """
+    p = Path(jsonl_path)
+    fp = p.parent / f"{p.stem}.dejavu-repair-fingerprint"
+    if not fp.is_file():
+        return False
+    try:
+        meta = json.loads(fp.read_text(encoding="utf-8"))
+        repaired_at = int(meta.get("repaired_at", 0))
+    except Exception:
+        return False
+    try:
+        mtime = int(p.stat().st_mtime)
+    except OSError:
+        return False
+    if mtime > repaired_at + 5:  # 5s slack for filesystem clock skew
+        try:
+            fp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
 def ingest_jsonl(jsonl_path: str, session_uuid: str, project_encoded: str | None, conn):
     """Ingest a single jsonl file. Idempotent via ingest_cursors. Per-session
     locked to prevent concurrent stop-hooks from racing on the same session."""
     if not os.path.exists(jsonl_path):
         print(f"  jsonl not found: {jsonl_path}", file=sys.stderr)
+        return 0
+
+    # v0.7.1: skip if the file was just reconstructed by `claude-dejavu
+    # repair` (spec section 7.1). The fingerprint sidecar tells us the
+    # current on-disk content already round-trips the DB — re-ingesting
+    # would land at new line-numbered idx values and duplicate every
+    # reconstructed turn.
+    if _should_skip_repaired(jsonl_path):
+        print(f"[ingest] {Path(jsonl_path).name}: "
+              f"skipped (fresh dejavu-repair-fingerprint)",
+              file=sys.stderr)
         return 0
 
     if not _acquire_ingest_lock(session_uuid):
@@ -396,6 +520,7 @@ def _ingest_jsonl_locked(jsonl_path: str, session_uuid: str,
         project_encoded = m.group(1) if m else "_orphan"
 
     slug = project_slug(project_encoded)
+    _warn_if_bench_misroute(slug)
     project_path_decoded = decode_project_path(project_encoded)
 
     cur = conn.cursor()
@@ -541,10 +666,15 @@ def _ingest_jsonl_locked(jsonl_path: str, session_uuid: str,
                     # in case a custom call site bypassed it.
                     text = _strip_nul(text)
                     # Compute gist for user/asst text (cheapest case in the hot path)
+                    # v0.8.6: make_gist may return (None, None) for
+                    # uncompressible content (code blocks, tracebacks,
+                    # diffs, JSON) — the caller stores gist=NULL and
+                    # recall falls back to content[:200].
                     gist_val, gist_method = (None, None)
                     if role in ("user", "assistant") and content_type == "text" and len(text) >= 30:
                         gist_val, gist_method = make_gist(text, role=role, content_type=content_type, prefer_llm=False)
-                        gist_val = _strip_nul(gist_val)
+                        if gist_val is not None:
+                            gist_val = _strip_nul(gist_val)
 
                     cur.execute("""
                         INSERT INTO turns (session_id, idx, parent_uuid, message_uuid, role, ts, content, content_type, tokens_in, tokens_out, model, gist, gist_method)
@@ -588,7 +718,15 @@ def _ingest_jsonl_locked(jsonl_path: str, session_uuid: str,
 
                     # Vectorize ONLY user/assistant text (skip tool_use/tool_result/thinking)
                     # AND skip trivially short messages.
-                    if role in ("user", "assistant") and content_type == "text" and len(text) >= CONTENT_VECTORIZE_MIN:
+                    # v0.8.7: trash-input gate runs before pushing to the
+                    # cloud-embed queue. Rejected rows stay vectorized=FALSE
+                    # (no schema change) and just don't get embedded —
+                    # the `_GATE_COUNTERS` summary surfaces how many we
+                    # skipped at end of ingest.
+                    if (role in ("user", "assistant")
+                            and content_type == "text"
+                            and len(text) >= CONTENT_VECTORIZE_MIN
+                            and _gate_ok(text)):
                         snippet = text[:CONTENT_VECTORIZE_MAX]
                         pending_vec.append((turn_id, {
                             "session_id": session_uuid,
@@ -650,8 +788,11 @@ def _ingest_jsonl_locked(jsonl_path: str, session_uuid: str,
     # Final completion heartbeat (always, regardless of N-turn cadence,
     # so even tiny sessions log a result line).
     elapsed = time.time() - started
+    gate_rej = _GATE_COUNTERS.get("rejected", 0)
+    gate_tail = (f"  gate_skipped={gate_rej}" if gate_rej else "")
     print(f"[ingest] {session_uuid[:8]} done  +{new_turns} turns  +{new_vectors} vectors  "
-          f"line={line_no}  bytes={bytes_read}/{file_size}  in {elapsed:.1f}s",
+          f"line={line_no}  bytes={bytes_read}/{file_size}  in {elapsed:.1f}s"
+          f"{gate_tail}",
           file=sys.stderr, flush=True)
 
     # Update session aggregates
@@ -781,6 +922,58 @@ def cmd_stop_hook(conn):
     res = ingest_jsonl(transcript, session_id, proj_enc, conn)
     if res:
         print(f"[stop-hook] +{res[0]} turns, +{res[1]} vectors")
+    # v0.9.3 — incremental sync runs unconditionally; the local
+    # vector index is AUTO-ON. Best-effort: when (a) numpy is
+    # available, (b) the index has been bootstrapped at least once
+    # (else there's nothing to sync against), and (c) Weaviate is
+    # reachable, we append any new turns. Any failure is logged +
+    # returns — the ingest itself already committed to PG/Weaviate
+    # so a vector-index sync miss just means the next ingest tick
+    # catches up. The old CLAUDE_DEJAVU_LOCAL_VECTOR_INDEX=false
+    # env survives as an explicit kill switch.
+    local_vec_disabled = (os.environ.get(
+        "CLAUDE_DEJAVU_LOCAL_VECTOR_INDEX", "true").lower()
+                           in ("0", "false", "no", "off"))
+    if not local_vec_disabled:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from vector_index import (  # type: ignore[import]
+                TurnVectorIndex, _is_available)
+            if _is_available():
+                # Resolve the data root the same way mcp/server.py
+                # does (XDG_DATA_HOME → ~/.local/share/claude-dejavu).
+                xdg = os.environ.get("XDG_DATA_HOME")
+                home = Path.home()
+                if sys.platform == "darwin":
+                    data_root = (home / "Library"
+                                  / "Application Support"
+                                  / "claude-dejavu")
+                elif sys.platform.startswith("win"):
+                    base = (os.environ.get("LOCALAPPDATA")
+                             or os.environ.get("APPDATA")
+                             or str(home / "AppData" / "Local"))
+                    data_root = Path(base) / "claude-dejavu"
+                else:
+                    data_root = (
+                        Path(xdg) / "claude-dejavu" if xdg
+                        else home / ".local" / "share"
+                              / "claude-dejavu")
+                override = os.environ.get(
+                    "CLAUDE_DEJAVU_DATA_ROOT")
+                if override:
+                    data_root = Path(override)
+                idx = TurnVectorIndex.load_or_empty(data_root)
+                if idx.is_loaded:
+                    n = idx.sync_new_from_weaviate(
+                        WEAVIATE_CLASS, WEAVIATE_URL)
+                    if n > 0:
+                        idx.save()
+                        print(f"[stop-hook] +{n} vectors to "
+                              f"local index")
+        except Exception as e:
+            # Non-fatal — log and move on.
+            print(f"[stop-hook] local-vector-index sync skipped: "
+                  f"{type(e).__name__}: {e}")
 
 
 def _ingest_one_with_own_conn(jsonl_path: str, session_uuid: str,
@@ -941,8 +1134,90 @@ def cmd_reingest(conn, session_id=None, missing_only=False, workers: int = 1):
     cmd_bootstrap_from_live(conn)
 
 
+def _retry_vectorize_worker(rows: list[tuple], batch_size: int,
+                              worker_label: str) -> tuple[int, int]:
+    """Process a shard of rows with its own PG connection.
+
+    Each worker is self-contained: opens its own conn, batches into
+    Weaviate via `weaviate_batch_upsert`, and on each successful batch
+    UPDATEs the matching `turns.vectorized` / `weaviate_id` rows.
+    Returns (succeeded, seen) so the caller can aggregate.
+
+    Failure mode: if connect fails or any unrecoverable exception
+    leaks, we log and return what we managed. We do NOT raise — the
+    parent thread aggregator treats us as a partial-success worker
+    so other shards still get to report their numbers.
+    """
+    try:
+        worker_conn = psycopg2.connect(PG_DSN)
+    except Exception as e:
+        print(f"[retry-vectorize] {worker_label} connect-failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return 0, 0
+
+    succeeded = 0
+    seen = 0
+    items: list[tuple[int, dict]] = []
+
+    def flush() -> None:
+        nonlocal succeeded
+        if not items:
+            return
+        ok = weaviate_batch_upsert(items)
+        if ok:
+            with worker_conn.cursor() as cur2:
+                psycopg2.extras.execute_values(
+                    cur2,
+                    "UPDATE turns AS t SET vectorized=TRUE, "
+                    "weaviate_id=v.wid::uuid FROM (VALUES %s) AS v(tid, wid) "
+                    "WHERE t.id = v.tid",
+                    [(tid, wid) for tid, wid in ok.items()],
+                )
+            worker_conn.commit()
+            succeeded += len(ok)
+        items.clear()
+
+    try:
+        for tid, sid, idx, slug, role, content, ts, model, ai_title in rows:
+            # v0.8.7: gate before queueing for embed. Reject low-signal
+            # turns (numeric noise, ack-only "ok"/"yes", boilerplate)
+            # without blowing cloud quota. `seen` still counts the row so
+            # progress reports stay accurate; just don't add to `items`.
+            seen += 1
+            if not _gate_ok(content or ""):
+                continue
+            snippet = (content or "")[:CONTENT_VECTORIZE_MAX]
+            items.append((tid, {
+                "session_id": sid,
+                "turn_id": idx,
+                "project_slug": slug or "",
+                "role": role,
+                "content": snippet,
+                "ts": ts.isoformat() if ts else None,
+                "model": model or "",
+                "ai_title": ai_title or "",
+            }))
+            if len(items) >= batch_size:
+                flush()
+        flush()
+    except Exception as e:
+        print(f"[retry-vectorize] {worker_label} error: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        try:
+            worker_conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            worker_conn.close()
+        except Exception:
+            pass
+    return succeeded, seen
+
+
 def cmd_retry_vectorize(conn, *, limit: int | None = None,
-                         batch_size: int = 64) -> None:
+                         batch_size: int = 64,
+                         workers: int = 1) -> None:
     """Re-vectorize turns stuck with vectorized=FALSE.
 
     Bypasses the cursor-based ingest dedup and just processes all
@@ -953,7 +1228,16 @@ def cmd_retry_vectorize(conn, *, limit: int | None = None,
 
     Filters mirror the live ingest path: only role in (user,assistant),
     only content_type=text, only content >= CONTENT_VECTORIZE_MIN chars.
+
+    workers > 1: shards rows into `workers` chunks; each thread gets
+    its own PG connection and runs the same flush loop in parallel.
+    Mirrors the cmd_reingest parallel pattern. Safe because each row's
+    UPDATE targets a distinct `turns.id` (no overlap between shards)
+    and `weaviate_batch_upsert` is thread-safe (each call gets its own
+    HTTP session). Default 1 keeps the single-threaded behavior.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     sql = (
         "SELECT t.id, t.session_id::text, t.idx, s.project_slug, "
         "       t.role, t.content, t.ts, t.model, s.ai_title "
@@ -973,64 +1257,248 @@ def cmd_retry_vectorize(conn, *, limit: int | None = None,
         cur.execute(sql, params)
         rows = cur.fetchall()
 
+    workers = max(1, workers)
     print(f"[retry-vectorize] {len(rows)} eligible turn(s); "
-          f"mode={_DEJAVU_EMBED_MODE}, batch_size={batch_size}")
+          f"mode={_DEJAVU_EMBED_MODE}, batch_size={batch_size}, "
+          f"workers={workers}")
     if not rows:
         return
 
     started = time.time()
-    items: list[tuple[int, dict]] = []
+
+    if workers == 1:
+        # Sequential path — uses the parent connection directly so
+        # behavior is bit-for-bit identical to the pre-v0.8.4
+        # single-threaded codepath (one PG conn, in-loop progress
+        # ticker every 200 rows).
+        succeeded_total = 0
+        seen_total = 0
+        last_progress = 0
+        items: list[tuple[int, dict]] = []
+
+        def flush() -> None:
+            nonlocal succeeded_total
+            if not items:
+                return
+            ok = weaviate_batch_upsert(items)
+            if ok:
+                with conn.cursor() as cur2:
+                    psycopg2.extras.execute_values(
+                        cur2,
+                        "UPDATE turns AS t SET vectorized=TRUE, "
+                        "weaviate_id=v.wid::uuid FROM (VALUES %s) AS v(tid, wid) "
+                        "WHERE t.id = v.tid",
+                        [(tid, wid) for tid, wid in ok.items()],
+                    )
+                conn.commit()
+                succeeded_total += len(ok)
+            items.clear()
+
+        try:
+            for tid, sid, idx, slug, role, content, ts, model, ai_title in rows:
+                # v0.8.7: gate first; skip embed for trash content.
+                seen_total += 1
+                if not _gate_ok(content or ""):
+                    if seen_total - last_progress >= 200:
+                        elapsed = max(0.001, time.time() - started)
+                        rate = succeeded_total / elapsed
+                        print(f"[retry-vectorize] {succeeded_total}/{seen_total} ok "
+                              f"({rate:.1f}/s, eta "
+                              f"{(len(rows) - seen_total) / max(rate, 0.1):.0f}s)")
+                        last_progress = seen_total
+                    continue
+                snippet = (content or "")[:CONTENT_VECTORIZE_MAX]
+                items.append((tid, {
+                    "session_id": sid,
+                    "turn_id": idx,
+                    "project_slug": slug or "",
+                    "role": role,
+                    "content": snippet,
+                    "ts": ts.isoformat() if ts else None,
+                    "model": model or "",
+                    "ai_title": ai_title or "",
+                }))
+                if len(items) >= batch_size:
+                    flush()
+                if seen_total - last_progress >= 200:
+                    elapsed = max(0.001, time.time() - started)
+                    rate = succeeded_total / elapsed
+                    print(f"[retry-vectorize] {succeeded_total}/{seen_total} ok "
+                          f"({rate:.1f}/s, eta "
+                          f"{(len(rows) - seen_total) / max(rate, 0.1):.0f}s)")
+                    last_progress = seen_total
+            flush()
+        finally:
+            elapsed = time.time() - started
+            gate_rej = _GATE_COUNTERS.get("rejected", 0)
+            gate_tail = f"  gate_skipped={gate_rej}" if gate_rej else ""
+            print(f"[retry-vectorize] done in {elapsed:.1f}s — "
+                  f"{succeeded_total}/{seen_total} succeeded "
+                  f"(failed: {seen_total - succeeded_total - gate_rej})"
+                  f"{gate_tail}")
+        return
+
+    # Parallel path — shard rows N ways. Each worker gets a contiguous
+    # slice (preserving the per-shard `ORDER BY t.id` ordering inside
+    # the slice) and its own PG connection. Shards are non-overlapping
+    # by row index → no double-write race.
+    n = len(rows)
+    shard_size = (n + workers - 1) // workers  # ceil division
+    shards = [rows[i:i + shard_size] for i in range(0, n, shard_size)]
     succeeded_total = 0
     seen_total = 0
-    last_progress = 0
-
-    def flush() -> None:
-        nonlocal succeeded_total
-        if not items:
-            return
-        ok = weaviate_batch_upsert(items)
-        if ok:
-            with conn.cursor() as cur2:
-                psycopg2.extras.execute_values(
-                    cur2,
-                    "UPDATE turns AS t SET vectorized=TRUE, "
-                    "weaviate_id=v.wid::uuid FROM (VALUES %s) AS v(tid, wid) "
-                    "WHERE t.id = v.tid",
-                    [(tid, wid) for tid, wid in ok.items()],
-                )
-            conn.commit()
-            succeeded_total += len(ok)
-        items.clear()
-
     try:
-        for tid, sid, idx, slug, role, content, ts, model, ai_title in rows:
-            snippet = (content or "")[:CONTENT_VECTORIZE_MAX]
-            items.append((tid, {
-                "session_id": sid,
-                "turn_id": idx,
-                "project_slug": slug or "",
-                "role": role,
-                "content": snippet,
-                "ts": ts.isoformat() if ts else None,
-                "model": model or "",
-                "ai_title": ai_title or "",
-            }))
-            seen_total += 1
-            if len(items) >= batch_size:
-                flush()
-            if seen_total - last_progress >= 200:
-                elapsed = max(0.001, time.time() - started)
-                rate = succeeded_total / elapsed
-                print(f"[retry-vectorize] {succeeded_total}/{seen_total} ok "
-                      f"({rate:.1f}/s, eta "
-                      f"{(len(rows) - seen_total) / max(rate, 0.1):.0f}s)")
-                last_progress = seen_total
-        flush()
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(_retry_vectorize_worker, shard, batch_size,
+                            f"w{idx}"): idx
+                for idx, shard in enumerate(shards)
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    s_ok, s_seen = fut.result()
+                except Exception as e:
+                    print(f"[retry-vectorize] w{idx} crashed: "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
+                    continue
+                succeeded_total += s_ok
+                seen_total += s_seen
+                print(f"[retry-vectorize] w{idx} done: "
+                      f"{s_ok}/{s_seen} succeeded")
     finally:
         elapsed = time.time() - started
+        gate_rej = _GATE_COUNTERS.get("rejected", 0)
+        gate_tail = f"  gate_skipped={gate_rej}" if gate_rej else ""
         print(f"[retry-vectorize] done in {elapsed:.1f}s — "
               f"{succeeded_total}/{seen_total} succeeded "
-              f"(failed: {seen_total - succeeded_total})")
+              f"(failed: {seen_total - succeeded_total - gate_rej})"
+              f"{gate_tail}")
+
+
+def cmd_backfill_gists(conn, *, limit: int | None = None,
+                        workers: int = 4,
+                        dry_run: bool = False,
+                        force: bool = False) -> None:
+    """Backfill `turns.gist` + `turns.gist_method` via distill_pipeline.
+
+    v0.8.6 (Context Economy phase 3). Walks every turn where
+    `gist IS NULL AND content IS NOT NULL` (or every distillable turn
+    when --force) and runs the load-bearing-anchor pipeline. Uncompressible
+    rows (code blocks, tracebacks, diffs, JSON) stay NULL — that's a
+    contract, not an error.
+
+    Sharding: rows are id-ordered then split into `workers` non-overlapping
+    chunks. Each thread gets its own PG connection. UPDATE targets distinct
+    `turns.id` per chunk so no write contention.
+
+    Idempotent by default: re-runs skip rows that already have a gist
+    unless `force=True` (then the row is re-distilled — useful after
+    bumping pipeline version).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Import the live pipeline (module-level make_gist may have been
+    # wrapped — go straight to the source so we can also surface
+    # bridge_version for the progress banner).
+    try:
+        import distill_pipeline as _dp
+    except Exception as exc:  # noqa: BLE001
+        print(f"[backfill-gists] distill_pipeline unavailable: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+
+    sql = (
+        "SELECT id, content, role, content_type "
+        "FROM turns "
+        "WHERE content IS NOT NULL "
+        "  AND length(content) >= 30 "
+        "  AND content_type = 'text' "
+        "  AND role IN ('user', 'assistant') "
+    )
+    if not force:
+        sql += "AND gist IS NULL "
+    sql += "ORDER BY id"
+    params: list = []
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    workers = max(1, workers)
+    n = len(rows)
+    bridge_tag = ("stub" if _dp.BRIDGE_IS_STUB
+                  else f"wheel/{_dp.BRIDGE_VERSION}")
+    print(f"[backfill-gists] {n} eligible turn(s); "
+          f"bridge={bridge_tag}, workers={workers}, "
+          f"dry_run={dry_run}, force={force}")
+    if not rows:
+        return
+
+    started = time.time()
+
+    def _process_shard(shard: list[tuple]) -> tuple[int, int, int]:
+        """Returns (distilled, skipped_uncompressible, errors)."""
+        if dry_run:
+            local_conn = None
+        else:
+            local_conn = psycopg2.connect(PG_DSN)
+        try:
+            d = s = e = 0
+            for tid, content, role, content_type in shard:
+                try:
+                    gist_val, gist_method = _dp.make_gist(
+                        content, role=role, content_type=content_type)
+                except Exception:  # noqa: BLE001
+                    e += 1
+                    continue
+                if gist_val is None:
+                    s += 1
+                    continue
+                gist_val = _strip_nul(gist_val)
+                if not dry_run and local_conn is not None:
+                    with local_conn.cursor() as cur2:
+                        cur2.execute(
+                            "UPDATE turns SET gist=%s, gist_method=%s "
+                            "WHERE id=%s",
+                            (gist_val, gist_method, tid))
+                    local_conn.commit()
+                d += 1
+            return d, s, e
+        finally:
+            if local_conn is not None:
+                try:
+                    local_conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    if workers == 1:
+        d, s, e = _process_shard(list(rows))
+    else:
+        shard_size = (n + workers - 1) // workers
+        shards = [rows[i:i + shard_size] for i in range(0, n, shard_size)]
+        d = s = e = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_process_shard, sh): i
+                       for i, sh in enumerate(shards)}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    sd, ss, se = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[backfill-gists] w{idx} crashed: "
+                          f"{type(exc).__name__}: {exc}", file=sys.stderr)
+                    continue
+                d += sd; s += ss; e += se
+                print(f"[backfill-gists] w{idx} done: "
+                      f"distilled={sd}, skipped={ss}, errors={se}")
+    elapsed = time.time() - started
+    print(f"[backfill-gists] done in {elapsed:.1f}s — "
+          f"distilled={d}, skipped_uncompressible={s}, errors={e}, "
+          f"total={n}")
 
 
 if __name__ == "__main__":
@@ -1053,9 +1521,12 @@ if __name__ == "__main__":
                    help="Used with --reingest: only re-ingest sessions whose "
                         ".jsonl is on disk but absent from the index.")
     p.add_argument("--workers", type=int, default=1,
-                   help="Number of parallel ingest workers (each gets its own "
-                        "PG connection). Useful with --reingest --missing-only "
-                        "for fast recovery across many sessions. Default 1.")
+                   help="Number of parallel workers (each gets its own PG "
+                        "connection). Useful with --reingest --missing-only "
+                        "for fast recovery across many sessions, OR with "
+                        "--retry-vectorize to shard the backlog across "
+                        "threads. Default 1 (single-threaded — bit-for-bit "
+                        "identical to pre-v0.8.4 behavior).")
     p.add_argument("--session")
     p.add_argument("--jsonl")
     p.add_argument("--project")
@@ -1063,7 +1534,22 @@ if __name__ == "__main__":
                    help="re-process turns where vectorized=FALSE — uses "
                         "DEJAVU_EMBED_MODE to decide local vs cloud")
     p.add_argument("--limit", type=int, default=None,
-                   help="cap items processed (with --retry-vectorize)")
+                   help="cap items processed (with --retry-vectorize / "
+                        "--backfill-gists)")
+    # v0.8.6 Context Economy phase 3 — distill_pipeline backfill
+    p.add_argument("--backfill-gists", action="store_true",
+                   help="Walk turns with gist IS NULL and populate "
+                        "turns.gist + turns.gist_method via the "
+                        "distill_pipeline (load-bearing-anchor "
+                        "preservation + skip-uncompressible).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="(with --backfill-gists) compute gists but "
+                        "do not write to the DB. Useful to preview "
+                        "skip-vs-distill ratios on a sample.")
+    p.add_argument("--force", action="store_true",
+                   help="(with --backfill-gists) re-distill rows "
+                        "that already have a gist. Default: skip "
+                        "(idempotent).")
     args = p.parse_args()
 
     # Top-level try/except — if anything below leaks an uncaught
@@ -1074,7 +1560,17 @@ if __name__ == "__main__":
     try:
         conn = psycopg2.connect(PG_DSN)
         if args.retry_vectorize:
-            cmd_retry_vectorize(conn, limit=args.limit)
+            cmd_retry_vectorize(conn, limit=args.limit,
+                                 workers=max(1, args.workers))
+        elif args.backfill_gists:
+            # v0.8.6 — distill_pipeline backfill. Default workers=4
+            # per spec; --workers overrides if explicitly set above.
+            bg_workers = args.workers if args.workers != 1 else 4
+            cmd_backfill_gists(conn,
+                                limit=args.limit,
+                                workers=max(1, bg_workers),
+                                dry_run=args.dry_run,
+                                force=args.force)
         elif args.reingest:
             cmd_reingest(conn,
                          session_id=args.session,

@@ -77,7 +77,7 @@ that specific model's transformers-inference image.
 
 ## Methodology
 
-- **Corpus**: 4,548 turns from `claude_audit.turns` (role IN ('user','assistant'), content_type='text', length ≥ 80 chars), truncated to 2000 chars each.
+- **Corpus**: 4,548 turns from `claude_dejavu_bench.turns` (role IN ('user','assistant'), content_type='text', length ≥ 80 chars), truncated to 2000 chars each.
 - **Eval pairs**: 9 hand-picked (paraphrase, gold_turn_id) pairs, each verified by reading the first 300 chars of the gold turn against the query.
 - **Instruction prefixes** applied per family:
   - BGE: `Represent this sentence for searching relevant passages: ` + query

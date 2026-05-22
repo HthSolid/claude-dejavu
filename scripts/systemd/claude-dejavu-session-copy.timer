@@ -1,0 +1,13 @@
+[Unit]
+Description=claude-dejavu session-copy (restic-backed snapshot) cadence timer
+Documentation=https://github.com/HthSolid/claude-dejavu
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${CADENCE_MIN}min
+AccuracySec=15sec
+Persistent=true
+Unit=claude-dejavu-session-copy.service
+
+[Install]
+WantedBy=timers.target

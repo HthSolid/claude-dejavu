@@ -297,6 +297,96 @@ def detect_missing_sessions(max_warn: int = 3) -> str | None:
     return f"⚠ claude-dejavu: {len(missing)}+ session(s) missing from ~/.claude/projects/ ({sample}…). Run `claude-dejavu restore --list` to see all."
 
 
+# ─── Step 4b: v0.8.0 session-copy snapshot (fire-and-forget) ─────────────────
+
+def _session_copy_repo_initialized() -> bool:
+    """Cheap probe: returns True iff the v0.8.0 restic repo + passphrase
+    file both exist under $DATA_ROOT. We skip the snapshot trigger
+    during the migration window (pre-init) so every Stop event doesn't
+    log a noisy 'repo missing' failure.
+    """
+    repo = DATA_ROOT / "restic-repo"
+    passphrase = DATA_ROOT / ".restic-pass"
+    return repo.is_dir() and passphrase.is_file()
+
+
+def fire_session_copy_take_async() -> str | None:
+    """Fire ``claude-dejavu session-copy take --tag stop-hook`` as a
+    detached background process. NEVER blocks Claude Code's exit.
+
+    Detachment is identical to the ingest_incremental path above:
+    POSIX uses ``start_new_session=True``; Windows uses
+    ``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP``. Any error is
+    swallowed (logged to a rotated session-copy log so doctor can see
+    it later).
+    """
+    if not _session_copy_repo_initialized():
+        return None  # pre-migration; nothing to snapshot into yet
+    # Resolve the dejavu CLI. Prefer the installed symlink at
+    # ~/.local/bin/claude-dejavu so we don't accidentally pick up a
+    # different rtk wrapper from PATH.
+    candidates = [
+        Path.home() / ".local" / "bin" / "claude-dejavu",
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+            / "claude-dejavu.bat",
+    ]
+    cli = next((str(c) for c in candidates if c.exists()), None)
+    if not cli:
+        # No CLI symlink — install.py hasn't run. Skip silently.
+        return None
+
+    log_dir = DATA_ROOT / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    log_path = log_dir / "session-copy-stop-hook.log"
+    # Cheap log rotation — keep the file under ~5 MB so a stuck loop
+    # doesn't fill disk. If oversize, rename to .1 and start fresh.
+    try:
+        if log_path.is_file() and log_path.stat().st_size > 5 * 1024 * 1024:
+            rotated = log_path.with_suffix(".log.1")
+            try:
+                rotated.unlink()
+            except FileNotFoundError:
+                pass
+            log_path.rename(rotated)
+    except OSError:
+        pass
+
+    is_windows = sys.platform.startswith("win")
+    try:
+        with open(log_path, "ab") as logf:
+            popen_kwargs: dict = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": logf,
+                "stderr": logf,
+            }
+            if is_windows:
+                # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                popen_kwargs["creationflags"] = 0x00000008 | 0x00000200
+                popen_kwargs["close_fds"] = True
+            else:
+                popen_kwargs["start_new_session"] = True
+                popen_kwargs["close_fds"] = True
+            subprocess.Popen(
+                [cli, "session-copy", "take",
+                 "--tag", "stop-hook"],
+                **popen_kwargs,
+            )
+        return "session-copy scheduled"
+    except Exception as exc:
+        # Never let a session-copy spawn failure crash the Stop hook.
+        try:
+            with open(log_path, "ab") as logf:
+                logf.write(
+                    f"[stop-hook] session-copy spawn failed: "
+                    f"{type(exc).__name__}: {exc}\n".encode())
+        except Exception:
+            pass
+        return None
+
+
 # ─── Step 5: throttled healthcheck ───────────────────────────────────────────
 
 def maybe_healthcheck() -> str | None:
@@ -349,10 +439,58 @@ def main():
     if snap:
         notes.append(snap)
 
+    # v0.8.0: fire-and-forget session-copy take (restic-backed). Skips
+    # silently when the v0.8.0 repo isn't initialized yet (during the
+    # migration window). Errors are swallowed — never block Claude
+    # Code's exit.
+    try:
+        fire_session_copy_take_async()
+    except Exception:
+        pass
+
     miss = detect_missing_sessions()
     msg_for_ui = miss  # this surfaces to the user via systemMessage
 
     maybe_healthcheck()
+
+    # Fire-and-forget background doc diff scan. Runs in the user's
+    # reading time — never blocks the next prompt. Detachment must work
+    # on both POSIX and Windows; mirrors the ingest_incremental pattern
+    # above so the child survives the Stop hook returning to Claude Code.
+    try:
+        import subprocess as _sp
+        plugin_root = Path(__file__).resolve().parent.parent
+        repo_start = Path.cwd()
+        doc_scan_kwargs: dict = {
+            "stdout": _sp.DEVNULL,
+            "stderr": _sp.DEVNULL,
+        }
+        if sys.platform.startswith("win"):
+            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — survive parent exit.
+            doc_scan_kwargs["creationflags"] = 0x00000008 | 0x00000200
+            doc_scan_kwargs["close_fds"] = True
+        else:
+            # POSIX: start_new_session makes child a session leader so a
+            # SIGHUP to Claude Code does NOT propagate. close_fds prevents
+            # holding parent fds open after detach.
+            doc_scan_kwargs["start_new_session"] = True
+            doc_scan_kwargs["close_fds"] = True
+        _sp.Popen(
+            [sys.executable,
+              str(plugin_root / "code" / "doc_diff_scan.py"),
+              str(repo_start)],
+            **doc_scan_kwargs,
+        )
+    except Exception as e:
+        # Never let a doc-scan failure crash the Stop hook.
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "code"))
+            from error_log import log_error
+            log_error("stop_hook.doc_scan_spawn",
+                      f"failed to spawn doc_diff_scan: {e}",
+                      level="warn")
+        except Exception:
+            pass
 
     # systemMessage is what Claude Code shows the user. Only emit if there's
     # something worth saying (deletion warning).

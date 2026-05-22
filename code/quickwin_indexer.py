@@ -414,8 +414,8 @@ def index_project_quickwins(project_dir: str, project_slug: str, conn,
 
     # ─── v0.4.5: fingerprint cache ─────────────────────────────────────
     # Quick-wins is the most expensive non-symbol indexer (~200s on
-    # sofi). Skip entirely if relevant files (CSS + i18n + tailwind
-    # config) haven't changed.
+    # a large monorepo). Skip entirely if relevant files (CSS + i18n
+    # + tailwind config) haven't changed.
     from file_state import IndexerCache, files_under
     relevant = list(files_under(
         root,

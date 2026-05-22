@@ -4,6 +4,157 @@ All notable changes to claude-dejavu. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely;
 versions track the plugin manifest in `.claude-plugin/plugin.json`.
 
+## [0.10.3] — 2026-05-22
+
+### New retrieval surface
+
+- **`dejavu_global_search`** — cross-project search with
+  identifier-aware substring fallback. Matches IPv4/IPv6, UUIDs,
+  hashes, paths, URLs, and emails verbatim when BM25 would strip
+  them.
+- **`dejavu_session_export`** — paginated full-session dump (gist
+  or full mode) for "give me everything from session X" questions.
+- **`dejavu_find_sessions`** — ranks past sessions by topic match
+  with per-session ai_title + snippet + match-count.
+- **`dejavu_status`** — corpus diagnostics: ingested turn /
+  observation / summary / session counts; PG/Weaviate drift
+  warnings; per-project vector index inventory.
+- **`dejavu_rate(turn_id, score)`** — explicit relevance feedback
+  that the ranker uses to boost subsequent searches.
+
+### Faster recall
+
+- **In-process numpy + hnswlib vector index** — auto-bootstraps on
+  first MCP startup, ~1ms p50 queries at 100k turns. Per-project
+  isolation via `claude-dejavu vector-index rebuild --slug
+  <project>`. Three HNSW presets (`balanced` / `high-recall` /
+  `low-memory`) selectable via `CLAUDE_DEJAVU_HNSW_PRESET`.
+- **Parallel hybrid + lexical branches** in `dejavu_search` —
+  Weaviate hybrid + PG lexical fire in parallel, results
+  interleaved (hybrid-first, dedup-by-turn_id).
+- **Per-project cache index** for `_OBS_CACHE` and `_SUM_CACHE` —
+  O(1) project-scoped lookups instead of O(N) scans.
+- **Precomputed topic-titles per slug** for `dejavu_summary`'s
+  digest mode.
+
+### Ranking learns from use
+
+- **Recall feedback loop** — `dejavu_expand` writes implicit
+  signals; `dejavu_rate` writes explicit ones. A per-turn
+  popularity score with 14-day half-life multiplies the base
+  rank score by `1 + log1p(popularity)`.
+- **Learned re-ranker** (opt-in) — 7-feature logistic regression
+  trained on the local feedback table. Runs in champion/challenger
+  shadow mode by default; only promoted to active when its win
+  rate clears 60% over 1000 decided trials. Per-user only; no
+  telemetry, no shared training, no data leaves the install.
+- **Cross-encoder reranker cascade** (opt-in) — Voyage AI /
+  Cohere / BGE-local via `CLAUDE_DEJAVU_RERANKER`. Reorders the
+  top-N by relevance score; falls back cleanly if no API key.
+
+### Hooks
+
+- **`PreCompact` hook** — when Claude Code is about to compact
+  older turns out of the active context window, emits an inline
+  `systemMessage` with a synthesized recovery memo (5-field
+  digest of the session's recent turns) plus pointers to the
+  recovery tools.
+- **Stop hook** — incremental ingest writes new turns to PG +
+  Weaviate per assistant response, then syncs the local vector
+  index from Weaviate (`turn_id > current_max`).
+- **`UserPromptSubmit`** — opt-in JIT recall now extracts
+  identifier patterns (IPs / hashes / paths / URLs / IPv6) from
+  the prompt and runs a substring-LIKE pass alongside BM25, so
+  short identifier-bearing prompts get full recall.
+
+### Resilience: corruption recovery + rescue toolkit
+
+A full data-loss recovery story sits behind the slash-commands.
+The mirror-based "deleted session" recovery introduced in earlier
+versions is now joined by per-record corruption recovery on every
+storage tier.
+
+**Session-level recovery**
+- `claude-dejavu repair` (`/dejavu-repair`) — detects zeroed,
+  partial-zero, truncated, or out-of-order JSONL session files
+  and rebuilds them from the dejavu database. Idempotent.
+- `claude-dejavu scan-corruption` (`/dejavu-scan-corruption`) —
+  walks `~/.claude/projects/` looking for shrunk or zero-byte
+  files across every known project.
+- `claude-dejavu recover-file` (`/dejavu-recover-file`) —
+  reconstructs a corrupted file from a file-history snapshot
+  plus chronological replay of captured Edit operations. Used
+  when a single source file is mangled mid-session.
+
+**Off-tree backup**
+- Restic-backed `claude-dejavu session-copy` — take / list / diff
+  / restore / prune / migrate-from-rsync / reclaim-legacy.
+  Content-addressed dedup means 90 days of snapshots fit in
+  ~5-10 GB. Driven by Stop-hook + scheduler — no systemd,
+  launchd, or Task Scheduler required.
+
+**Storage-tier rescue**
+- `claude-dejavu pg-rescue` (`/dejavu-pg-rescue`) — Postgres
+  corruption rescue toolkit: scan, patch-TOAST, reset-flags,
+  rebuild-table, reindex. Recovers rows whose corruption
+  triggered `could not read block` errors.
+- `claude-dejavu weaviate-rescue` (`/dejavu-weaviate-rescue`) —
+  Weaviate corruption rescue: scan, quarantine-segment,
+  redo-class. Recovers the vector store after segment-level
+  damage.
+- `claude-dejavu rescue-shard` (`/dejavu-rescue`) — pure-stdlib
+  Go segment reader that pulls records out of an otherwise
+  unreadable Weaviate shard when Weaviate itself can't open it.
+
+**Diagnostics**
+- `claude-dejavu doctor` — diagnoses install + runtime health
+  (PG, Weaviate, venv, hooks, schema integrity, table presence).
+  Auto-repairs missing tables via `health.check_and_repair_storage`.
+
+### Recovery via the assistant
+
+- **`PreCompact` recovery toolchain** — `dejavu_session_export`,
+  `dejavu_global_search`, and `dejavu_summary(limit=1)` are
+  surfaced to the assistant the moment compaction is imminent.
+- **Identifier-aware `dejavu_status` block** for the vector index
+  enumerating per-project slugs on disk.
+
+### Performance addon
+
+- **`dejavu_bridge`** is now framed as what it is: an optional
+  Rust-speed performance wheel. The in-tree
+  `code/dejavu_bridge_stub.py` provides functional Python
+  implementations of all six primitives (`distill`, `disclose`,
+  `gate`, `retrieve_rrf`, `sem_cache_lookup`, `topic_reweight`).
+  Every MCP tool, full recall, ranking, and bench numbers are
+  unchanged in standard (stub) mode. The wheel adds compressed
+  gists + ML-tuned thresholds + Rust speed when installed.
+
+### Bench numbers
+
+Methodology + markers unchanged from v0.5. Bench fixture
+(`claude-mem-observer-sessions-bench` slug, isolated
+`ClaudeDejavuTurn_bench` Weaviate class):
+
+```
+                          p50          recall
+dejavu_search             50-80 ms     8/8
+dejavu_observations       27 ms        8/8
+dejavu_summary            20-30 ms     8/8
+```
+
+### Tests
+
+1471 tests in the pre-push gate, run by
+`bash scripts/local-ci.sh fast`. No external dependencies for
+the infra-free regression suite.
+
+### License
+
+FSL-1.1-ALv2 — free for individual + internal corporate use.
+Commercial license available at
+`dejavu@hendrikthurau.enterprises`.
+
 ## [0.6.1b] — 2026-05-08
 
 Diagnostic logging fix on top of v0.6.1.

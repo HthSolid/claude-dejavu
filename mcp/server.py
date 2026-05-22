@@ -16,7 +16,10 @@ Override per call with `scope='global' | 'project:name' | 'ws:name'`.
 """
 import json
 import os
+import re
 import sys
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -27,6 +30,7 @@ import psycopg2.extras
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "code"))
 from scope import resolve_scope, apply_pg_filter, weaviate_where, ScopeFilter  # noqa: E402
+from topic import tokenize_query as _tokenize_query  # noqa: E402  (v0.8.10)
 
 from mcp.server.fastmcp import FastMCP
 
@@ -144,6 +148,54 @@ def _lexical_pg(query: str, limit: int, scope: ScopeFilter) -> list[dict]:
 
 
 def _hybrid_search(query: str, limit: int, scope: ScopeFilter) -> list[dict]:
+    """Hybrid Weaviate search.
+
+    v0.8.10 Fix 4 — recall investigation. Pre-v0.8.10 this function ran a
+    plain `hybrid: {query: ..., alpha: 0.5}` GraphQL call: Weaviate would
+    do its own server-side text2vec lookup. That meant the MCP search path
+    silently skipped every recall improvement shipped to the CLI search
+    path in v0.8.7-v0.8.9 (caller-side cloud query embed, RRF fusion of
+    BM25 + nearVector, topic-aware re-ranking).
+
+    Result on the bench: MCP `dejavu_search` recall == 1/8, same as a
+    one-line GraphQL hybrid call should give. The CLI's `dejavu search`
+    on the same corpus + queries does better because it routes through
+    `code/recall._hybrid`. The fix is to make the MCP path delegate to
+    the same function — single source of truth for recall behavior.
+
+    Defensive: if recall._hybrid raises (e.g. broken bridge wheel),
+    fall back to the pre-v0.8.10 raw GraphQL call so MCP recall can
+    never be _worse_ than v0.8.9.
+
+    Env override `CLAUDE_DEJAVU_MCP_USE_LEGACY_HYBRID=1` keeps the old
+    behavior. Lets ops bisect a future regression at the MCP layer
+    without rolling back the whole release.
+    """
+    if os.environ.get("CLAUDE_DEJAVU_MCP_USE_LEGACY_HYBRID") not in (
+        None, "", "0", "false", "False",
+    ):
+        return _hybrid_search_legacy(query, limit, scope)
+    try:
+        from recall import _hybrid as _recall_hybrid  # noqa: E402
+        hits = _recall_hybrid(query, limit, scope)
+        # Normalize shape: recall._hybrid returns the same fields we
+        # expose in the legacy path (`session_id turn_id project_slug
+        # role ts ai_title _additional.score`). No additional adaptation
+        # needed — the caller in dejavu_search already reads exactly
+        # these keys (see lines just below).
+        return hits or []
+    except Exception as e:  # noqa: BLE001
+        # Fall back to the pre-v0.8.10 raw hybrid call. Never crash MCP
+        # search because a downstream module raised.
+        print(f"recall._hybrid failed ({type(e).__name__}: {e}), "
+              f"falling back to legacy hybrid", file=sys.stderr)
+        return _hybrid_search_legacy(query, limit, scope)
+
+
+def _hybrid_search_legacy(query: str, limit: int,
+                            scope: ScopeFilter) -> list[dict]:
+    """Pre-v0.8.10 raw GraphQL hybrid call. Preserved as the fallback
+    path + opt-out target for ops bisection."""
     where = weaviate_where(scope)
     gql = f'''{{
       Get {{
@@ -172,14 +224,77 @@ def _hybrid_search(query: str, limit: int, scope: ScopeFilter) -> list[dict]:
 
 # ─── Tool: search (cheap, gist-only) ─────────────────────────────────────────
 
+def _resolve_workspace_repos(name: str) -> list[str]:
+    """Look up workspaces.repo_ids by name. Returns [] if missing or
+    if the workspaces table isn't present yet."""
+    try:
+        conn = _conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT repo_ids FROM workspaces WHERE name = %s", (name,))
+            row = cur.fetchone()
+        return list(row[0]) if row and row[0] else []
+    except Exception:
+        return []
+
+
+def _format_kind_hits(hits: list[dict], kinds: list[str],
+                       source_tag: str) -> str:
+    """Render mixed-kind hits (doc/symbol/route/turn) for MCP output.
+
+    Each hit dict carries `kind` and may carry doc-specific or
+    code-specific fields. Falls back to a generic line if shape
+    is unknown."""
+    if not hits:
+        return f"No matches across kinds={kinds} [via {source_tag}]"
+    lines = [f"kinds={kinds}  hits={len(hits)}  via={source_tag}"]
+    for i, h in enumerate(hits, 1):
+        k = h.get("kind") or "?"
+        if k == "doc":
+            heading = h.get("heading_path") or ""
+            summary = h.get("one_line_summary") or ""
+            path = h.get("doc_path") or ""
+            score = float(h.get("score") or 0)
+            lines.append(
+                f"[{i}] doc score={score:.2f} {path}#{heading} — "
+                f"{summary[:120]}")
+        elif k in ("symbol", "route"):
+            name = h.get("name") or ""
+            sig = h.get("signature") or ""
+            fp = h.get("file_path") or ""
+            sim = float(h.get("similarity") or 0)
+            lines.append(
+                f"[{i}] {k} sim={sim:.2f} {name} :: {sig[:80]} ({fp})")
+        else:
+            rid = h.get("result_id") or "?"
+            lines.append(f"[{i}] {k} {rid}")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def dejavu_search(query: str, scope: str | None = None, limit: int = 10,
-                  mode: str = "auto") -> str:
+                  mode: str = "auto",
+                  kinds: list[str] | None = None,
+                  repo_id: str | None = None,
+                  workspace: str | None = None) -> str:
     """
-    Tiered search across past turns:
+    USE THIS WHEN the user asks "what did we do", "what changed",
+    "who/what broke X", "did we ever mention Y", "search past
+    activity", "trace this across sessions", "I remember we talked
+    about Z" — anything whose answer lives in prior conversation
+    history. Prefer this tool over grepping local files; the actual
+    conversation corpus is in this index, not in ~/.claude/projects/.
+
+    For a forced cross-project search (no `scope` argument needed,
+    identifier-aware substring fallback for IPs / URLs / hashes /
+    paths) use dejavu_global_search. For one specific session's
+    complete content use dejavu_session_export. For "is anything
+    even ingested?" diagnostics use dejavu_status.
+
+    Tiered modes:
       mode='lexical'  → PG FTS+trigram only (sub-20ms, exact-string-friendly)
       mode='hybrid'   → Weaviate BM25+vector only (semantic, 60-300ms)
-      mode='auto'     → lexical first, fall through to hybrid if <limit/2 hits (default)
+      mode='auto'     → lexical+hybrid in parallel, interleaved (default)
 
     Returns a CHEAP list of {turn_id, score, gist} for each hit. Use this
     first; then call dejavu_expand(turn_ids) for full content of specific turns.
@@ -189,7 +304,59 @@ def dejavu_search(query: str, scope: str | None = None, limit: int = 10,
         scope: 'global' | 'project[:name]' | 'workspace[:name]' (default: auto)
         limit: max results (default 10)
         mode: 'auto' | 'lexical' | 'hybrid'
+        kinds: subset of ["turn","doc","symbol","route"]. If omitted the
+                tool keeps its pre-v0.7 behavior (turn search). When set
+                we dispatch through semantic_search.search() to fuse
+                doc/symbol/route hits via RRF.
+        repo_id: filter to a single repo (doc kind primarily). Ignored
+                  unless `kinds` contains a non-turn kind.
+        workspace: name of a saved workspace; OR-filters over its
+                    repo_ids. Mutually exclusive with repo_id (workspace
+                    wins). Only honored when `kinds` is set.
     """
+    # ── New v0.7 dispatch: kinds-array path ────────────────────────────
+    if kinds:
+        # Resolve repo filter list.
+        repo_ids: list[str] | None = None
+        if workspace:
+            repo_ids = _resolve_workspace_repos(workspace)
+            if not repo_ids:
+                return f"workspace '{workspace}' not found or empty"
+        elif repo_id:
+            repo_ids = [repo_id]
+        elif "doc" in kinds:
+            try:
+                import repo_id as _rid  # type: ignore
+                rid, _ = _rid.resolve()
+                repo_ids = [rid] if rid else None
+            except Exception:
+                repo_ids = None
+
+        # Project slug for symbol/route filters.
+        proj_slug = _CWD_SLUG
+
+        non_turn_kinds = [k for k in kinds if k != "turn"]
+
+        if repo_ids and len(repo_ids) > 1 and "doc" in non_turn_kinds:
+            # Multi-repo workspace: fan out doc search across repos,
+            # RRF on the client side. symbol/route are project-scoped
+            # so we run them once.
+            rankings: list[list[dict]] = []
+            for rid in repo_ids:
+                rankings.append(_semantic_search(
+                    query, project_slug=proj_slug,
+                    kinds=non_turn_kinds, repo_id=rid, limit=limit))
+            from semantic_search import _rrf_fuse as _fuse  # noqa: E402
+            hits = _fuse(rankings)[:limit]
+        else:
+            single = repo_ids[0] if repo_ids else None
+            hits = _semantic_search(
+                query, project_slug=proj_slug,
+                kinds=non_turn_kinds or kinds,
+                repo_id=single, limit=limit)
+        return _format_kind_hits(hits, kinds, source_tag="semantic")
+
+    # ── Legacy turn-only path ─────────────────────────────────────────
     sc = _scope(scope)
     source_tag = ""
     if mode == "lexical":
@@ -199,31 +366,316 @@ def dejavu_search(query: str, scope: str | None = None, limit: int = 10,
         hits = _hybrid_search(query, limit, sc)
         source_tag = "weaviate-hybrid"
     else:
-        # auto: try fast path first, augment if too few results
-        lex_hits = _lexical_pg(query, limit, sc)
-        if len(lex_hits) >= max(3, limit // 2):
-            hits, source_tag = lex_hits, "pg-lexical"
-        else:
-            wv_hits = _hybrid_search(query, limit - len(lex_hits), sc)
-            seen = {h.get("turn_id") for h in lex_hits}
-            merged = lex_hits + [h for h in wv_hits if h.get("turn_id") not in seen]
+        # v0.8.13 — auto mode now interleaves pg-lexical and hybrid rather
+        # than short-circuiting on the first ≥limit/2 pg hits.
+        #
+        # Why: on a dense corpus the FTS index returns plenty of plain-text
+        # candidates, but the top-N-by-recency PG branch tends to surface
+        # XML-stub turns (e.g. `<observed_from_primary_session><what_happened>Edit</…>`)
+        # whose plain-text content matches a single query stem. Those crowd
+        # out the semantically richer hybrid hits that DO contain the
+        # caller's actual phrase. The previous short-circuit silently
+        # bypassed the hybrid path entirely whenever FTS produced
+        # ≥max(3, limit/2) hits — which is essentially always.
+        #
+        # New: run BOTH branches up to `limit` hits each, then interleave
+        # (hybrid first, then dedup-append pg-lexical) and trim to the
+        # requested limit. Hybrid-first means semantic matches lead;
+        # pg-lexical fills tail slots so exact-string queries still
+        # surface their literal matches. Symmetric union — neither branch
+        # can starve the other.
+        # v0.8.15 — run the two branches in parallel. Weaviate hybrid is
+        # the slow path (HTTP roundtrip + BM25/vector RRF); PG-lexical is
+        # fast. Sequential execution paid `wv + lex`; parallel pays
+        # `max(wv, lex)` ≈ `wv`. Each call is stateless (own psycopg2
+        # conn / requests session), so a 2-thread executor is safe.
+        # When merging we still prefer wv-first; dedup-by-turn_id keeps
+        # the chosen-by-source semantic (a turn returned by both
+        # branches keeps the wv ordering — FTS rank and hybrid score
+        # aren't directly comparable, so picking by source is
+        # defensible and matches v0.8.13 behaviour).
+        import concurrent.futures as _cf
+        # v0.9.3 — local in-process vector index is AUTO-ON. The
+        # branch participates in every search; when the index is
+        # empty (no bootstrap run yet) it returns [] and the merge
+        # falls back to weaviate + pg-lexical without surprise. The
+        # old CLAUDE_DEJAVU_LOCAL_VECTOR_INDEX=false survives as
+        # an explicit kill switch only — set it when you need to
+        # rule out the local index as a recall variable.
+        local_vec_disabled = (os.environ.get(
+            "CLAUDE_DEJAVU_LOCAL_VECTOR_INDEX", "true").lower()
+                               in ("0", "false", "no", "off"))
+
+        def _local_vec_branch() -> list[dict]:
+            if local_vec_disabled:
+                return []
+            try:
+                from vector_index import (  # type: ignore[import]
+                    get_index, _is_available)
+                if not _is_available():
+                    return []
+                from query_embed import embed_query  # type: ignore[import]
+                # Embed the query via the cloud worker.
+                # (PG embed_cache hides repeat cost.)
+                vec = embed_query(query, timeout_s=1.0)
+                if not vec:
+                    return []
+                # v0.9.5 — pick the per-project index when the
+                # scope resolves to a single project AND that slug
+                # has a populated index. Else fall back to the
+                # shared `_default` index. This way users who opted
+                # into per-project isolation get higher precision
+                # on project-scoped queries; users who haven't keep
+                # v0.9.4 behaviour.
+                slug_choice = "_default"
+                try:
+                    sc_projects = getattr(sc, "projects", None)
+                    if (sc_projects and len(sc_projects) == 1):
+                        from vector_index import (  # type: ignore[import]
+                            list_known_slugs)
+                        candidate = sc_projects[0]
+                        if candidate in list_known_slugs(DATA_ROOT):
+                            slug_choice = candidate
+                except Exception:
+                    pass
+                idx = get_index(DATA_ROOT, slug=slug_choice)
+                pairs = idx.query(vec, k=limit)
+                if not pairs:
+                    return []
+                tids = [p[0] for p in pairs]
+                score_by_tid = {p[0]: p[1] for p in pairs}
+                with _conn() as c:
+                    cur = c.cursor()
+                    cur.execute(
+                        "SELECT t.id, t.session_id::text, "
+                        "  s.project_slug, t.role, t.ts, "
+                        "  t.content, t.gist "
+                        "FROM turns t JOIN sessions s "
+                        "  ON s.id = t.session_id "
+                        "WHERE t.id = ANY(%s)", (tids,))
+                    out = []
+                    for r in cur.fetchall():
+                        tid, sid, proj, role, ts, content, gist = r
+                        out.append({
+                            "session_id": sid, "turn_id": tid,
+                            "project_slug": proj, "role": role,
+                            "ts": ts.isoformat() if ts else None,
+                            "content": content, "gist": gist,
+                            "_additional": {
+                                "score": score_by_tid.get(tid, 0.0),
+                                "source": "pg-vector-local",
+                            },
+                        })
+                # Preserve the cosine-similarity ordering from the
+                # local index — PG returned rows in id order.
+                out.sort(key=lambda h: -float(
+                    h["_additional"]["score"]))
+                return out
+            except Exception:
+                return []
+
+        with _cf.ThreadPoolExecutor(max_workers=3) as ex:
+            f_wv = ex.submit(_hybrid_search, query, limit, sc)
+            f_lex = ex.submit(_lexical_pg, query, limit, sc)
+            f_lvi = ex.submit(_local_vec_branch)
+            wv_hits = f_wv.result()
+            lex_hits = f_lex.result()
+            lvi_hits = f_lvi.result()
+        wv_failed = bool(wv_hits and "_error" in wv_hits[0])
+        if wv_failed:
+            wv_hits = []
+        # Merge order: wv-first (semantic) → local-vector (semantic
+        # without WV roundtrip) → pg-lexical (exact-string tail).
+        # Dedup by turn_id, chosen-by-source: the leading branch
+        # keeps its ordering even when the same turn appears later.
+        if wv_hits or lvi_hits or lex_hits:
+            seen: set = set()
+            merged: list[dict] = []
+            for branch in (wv_hits, lvi_hits, lex_hits):
+                for h in branch:
+                    tid = h.get("turn_id")
+                    if tid in seen:
+                        continue
+                    seen.add(tid)
+                    merged.append(h)
             hits = merged[:limit]
-            source_tag = "pg+weaviate" if lex_hits else "weaviate-hybrid"
+            tags: list[str] = []
+            if wv_hits:
+                tags.append("weaviate-hybrid")
+            if lvi_hits:
+                tags.append("pg-vector-local")
+            if lex_hits:
+                tags.append("pg-lexical")
+            source_tag = "+".join(tags)
+        else:
+            hits = []
+            source_tag = "no-hits"
     if hits and "_error" in hits[0]:
         return f"Search failed: {hits[0]['_error']} (scope: {sc.explain()})"
     if not hits:
         return f"No matches in scope: {sc.explain()} [via {source_tag}]"
 
+    # v0.9.6 — popularity boost. Each hit's score gets multiplied by
+    # `1 + log1p(popularity)` where popularity is the sum of
+    # decay-weighted feedback signals for that turn_id over the last
+    # 30 days. Cached per-process, refreshed every 30 min.
+    #
+    # v0.10.0 — this is now the CHAMPION ranker. We also compute the
+    # CHALLENGER (learned LR) ranking in shadow mode and log
+    # champion-vs-challenger trials to recall_ranking_trials for the
+    # promotion arbiter. The model only sees the champion's order;
+    # promoting the challenger requires it to demonstrably outperform
+    # over CLAUDE_DEJAVU_RANKER_PROMOTE_MIN_N=1000 trials at
+    # CLAUDE_DEJAVU_RANKER_PROMOTE_WIN_RATE=0.60.
+    popularity_by_tid: dict[int, float] = {}
+    try:
+        _refresh_feedback_cache_if_stale()
+        if _FEEDBACK_POPULARITY:
+            for h in hits:
+                tid = h.get("turn_id")
+                if not isinstance(tid, int):
+                    continue
+                boost = _popularity_boost(tid)
+                popularity_by_tid[tid] = boost
+                if boost > 1.0:
+                    add = dict(h.get("_additional") or {})
+                    base = float(add.get("score") or 0.0)
+                    add["score"] = base * boost
+                    add["popularity_boost"] = boost
+                    h["_additional"] = add
+            hits.sort(key=lambda x: -float(
+                x.get("_additional", {}).get("score") or 0))
+    except Exception:
+        # Never let a feedback-cache problem break search.
+        pass
+
+    # v0.10.0 — dual-ranking + arbiter. Compute the LR challenger's
+    # score per hit, log a trial row per hit so dejavu_expand can
+    # later mark winners, then check whether the arbiter says it's
+    # time to promote (or demote) the challenger. Everything is
+    # wrapped in a try/except so any failure here NEVER affects the
+    # search response.
+    try:
+        from ranker import (  # type: ignore[import]
+            get_ranker, extract_features, _resolve_mode)
+        ranker_mode = _resolve_mode()
+        # Get the active mode, possibly auto-flipped by the arbiter.
+        active = _ranker_arbiter_active_mode(ranker_mode)
+        rk = get_ranker(DATA_ROOT)
+        # Compute challenger scores for every hit.
+        query_project = (sc.projects[0]
+                          if getattr(sc, "projects", None)
+                              and len(sc.projects) == 1
+                          else None)
+        challenger_scores: dict[int, float] = {}
+        for h in hits:
+            tid = h.get("turn_id")
+            if not isinstance(tid, int):
+                continue
+            feats = extract_features(
+                h, query, query_project,
+                popularity_boost=popularity_by_tid.get(tid, 1.0))
+            challenger_scores[tid] = rk.score(feats)
+        # Rank under each scorer. champion_rank reflects the order
+        # `hits` is already in (after the popularity boost). The
+        # challenger_rank we compute by sorting by challenger_score.
+        champion_order = [h.get("turn_id") for h in hits
+                            if isinstance(h.get("turn_id"), int)]
+        challenger_sorted = sorted(
+            champion_order,
+            key=lambda t: -challenger_scores.get(t, 0.5))
+        # If active mode is `learned`, REORDER the user-visible hits
+        # to the challenger's ordering.
+        if active == "learned":
+            tid_to_hit = {h.get("turn_id"): h for h in hits}
+            hits = [tid_to_hit[t] for t in challenger_sorted
+                    if t in tid_to_hit]
+        # Log trials — best-effort PG write.
+        _log_ranking_trials(
+            query, champion_order, challenger_sorted)
+    except Exception:
+        pass
+
+    # v0.9.6 — remember this search query so a follow-up
+    # dejavu_expand can attribute its implicit-feedback row.
+    try:
+        _push_recent_query(query)
+    except Exception:
+        pass
+
     # PG-lexical hits already carry their gist + content inline (zero second roundtrip).
     # Weaviate hits don't carry the gist — fetch only what's missing.
     needs_gist = [int(h["turn_id"]) for h in hits if h.get("turn_id") and not h.get("gist")]
-    gist_map = {}
+    gist_map: dict[int, str] = {}
+    # v0.8.13 — also fetch the leading slice of t.content so callers get a
+    # query-relevant snippet, not just the 120-char generated gist. The
+    # gist field is generated at ingest-time without query context; on
+    # XML-wrapped turns it often captures the wrapper opening
+    # (`<observed_from_primary_session><what_happened>Edit</…>`) and hides
+    # the marker phrase further down. Fetching the content snippet lets
+    # the response carry both: the wrapper header AND a deeper window.
+    content_map: dict[int, str] = {}
     if needs_gist:
         with _conn() as c:
             cur = c.cursor()
             cur.execute("SELECT id, gist, content FROM turns WHERE id = ANY(%s)", (needs_gist,))
             for tid, gist, content in cur.fetchall():
-                gist_map[tid] = gist or (content or "")[:120]
+                gist_map[tid] = gist or (content or "")[:200]
+                content_map[tid] = (content or "")
+
+    # v0.9.0 — cross-encoder reranker pass. Opt-in via env
+    # `CLAUDE_DEJAVU_RERANKER=voyage|cohere|bge|auto`. When off
+    # (default) this is a no-op. When on, takes the hit list and
+    # re-orders the top-N by Voyage / Cohere / local BGE relevance
+    # score, demoting weak matches that BM25+vector RRF promoted
+    # by recency. Each hit picks up `_additional.rerank_score` and
+    # `_additional.rerank_source`. NEVER raises — failures fall
+    # back to the input ordering.
+    try:
+        from reranker import rerank as _rerank  # type: ignore[import]
+        # Materialize content onto each hit so the reranker scores
+        # against the SAME text we're about to snippet.
+        for h in hits:
+            tid = int(h.get("turn_id") or 0)
+            if not h.get("content") and tid in content_map:
+                h["content"] = content_map[tid]
+        hits = _rerank(query, hits, text_field="content",
+                        top_k=min(limit, len(hits)))
+    except Exception:
+        # Never let reranker import / config errors break search.
+        pass
+
+    # v0.8.13 — snippet selection. For each hit, if the gist alone is
+    # marker-thin (always the case for hits where the gist was generated
+    # at ingest and the body is longer than the gist window), pick a
+    # query-aware snippet from the full content: the longest substring
+    # containing the most stemmed query tokens. Falls back to a head
+    # window of `content` if no token-bearing window is found.
+    query_tokens = _tokenize_query(query)
+
+    def _snippet_for(content: str, gist: str, max_chars: int = 500) -> str:
+        if not content:
+            return (gist or "")[:max_chars]
+        # Scan the content in windows; pick the one with the most token hits.
+        if not query_tokens:
+            return (gist or content)[:max_chars]
+        WIN = max_chars
+        STEP = max_chars // 2
+        cl = content.lower()
+        best_score, best_pos = -1, 0
+        for i in range(0, max(1, len(cl) - WIN // 2), STEP):
+            window = cl[i:i + WIN]
+            score = sum(1 for t in query_tokens if t in window)
+            if score > best_score:
+                best_score, best_pos = score, i
+            if best_score >= len(query_tokens):
+                break
+        if best_score <= 0:
+            return (gist or content[:max_chars])[:max_chars]
+        snippet = content[best_pos:best_pos + WIN].replace("\n", " ")
+        # Collapse runs of whitespace for compactness.
+        import re as _re
+        return _re.sub(r"\s+", " ", snippet).strip()[:max_chars]
 
     lines = [f"scope={sc.explain()}  hits={len(hits)}  via={source_tag}"]
     for i, h in enumerate(hits, 1):
@@ -232,23 +684,22 @@ def dejavu_search(query: str, scope: str | None = None, limit: int = 10,
         proj = h.get("project_slug") or "?"
         sess = (h.get("session_id") or "")[:8]
         ts = (h.get("ts") or "")[:10]
-        gist = h.get("gist") or gist_map.get(tid) or (h.get("content") or h.get("ai_title") or "(no gist)")[:120]
-        lines.append(f"[{i}] turn={tid} score={score:.2f} {proj}/{sess} {ts}  {gist[:120]}")
+        gist = h.get("gist") or gist_map.get(tid) or ""
+        content = h.get("content") or content_map.get(tid) or ""
+        snippet = _snippet_for(content, gist, max_chars=500)
+        if not snippet:
+            snippet = (h.get("ai_title") or "(no gist)")[:500]
+        lines.append(f"[{i}] turn={tid} score={score:.2f} {proj}/{sess} {ts}  {snippet}")
     lines.append(f"\nCall dejavu_expand([turn_ids…]) to read full content for specific turns.")
     return "\n".join(lines)
 
 
 # ─── Tool: expand (full content for specific IDs) ────────────────────────────
 
-@mcp.tool()
-def dejavu_expand(turn_ids: list[int]) -> str:
-    """
-    Return full content for the given turn IDs. Use after dejavu_search to
-    pull only the turns you actually need. Costs ~500-1500 tokens per turn.
 
-    Args:
-        turn_ids: list of integer turn ids returned by dejavu_search
-    """
+def _expand_turn_batch(turn_ids: list[int]) -> str:
+    """Legacy batch-fetch turn expansion. Single GraphQL/SQL query for many
+    int turn ids. Preserved verbatim from the pre-v0.7 dejavu_expand body."""
     if not turn_ids:
         return "No turn_ids provided."
     with _conn() as c:
@@ -271,6 +722,1272 @@ def dejavu_expand(turn_ids: list[int]) -> str:
         if r.get('ai_title'):
             out.append(f"   session-title: {r['ai_title']}")
         out.append(r['content'] or "(empty)")
+    return "\n".join(out)
+
+
+def _expand_turn(result_id, level: str = "section") -> str:
+    """Expand a turn result_id. Accepts int or 'turn|N' string."""
+    if isinstance(result_id, str) and result_id.startswith("turn|"):
+        try:
+            turn_id = int(result_id.split("|", 1)[1])
+        except (ValueError, IndexError):
+            return f"[invalid turn id: {result_id}]"
+    else:
+        try:
+            turn_id = int(result_id)
+        except (TypeError, ValueError):
+            return f"[invalid turn id: {result_id}]"
+    return _expand_turn_batch([turn_id])
+
+
+def _fetch_doc_chunk(repo_id: str, file_path: str,
+                       chunk_idx: int) -> dict | None:
+    """Single-object GraphQL fetch by (repo_id, file_path, chunk_idx)."""
+    from semantic_search import _http, DOC_CLASS_NAME  # type: ignore
+    def _esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+    body = {"query":
+        "{ Get { " + DOC_CLASS_NAME + "(limit: 1, where: {"
+        "operator: And, operands: ["
+        f'{{path: ["repo_id"], operator: Equal, valueText: "{_esc(repo_id)}"}},'
+        f'{{path: ["file_path"], operator: Equal, valueText: "{_esc(file_path)}"}},'
+        f'{{path: ["chunk_idx"], operator: Equal, valueInt: {int(chunk_idx)}}}'
+        "] }) { content heading_path } } }"}
+    r = _http("POST", "/v1/graphql", body=body)
+    hits = (r or {}).get("data", {}).get("Get", {}).get(DOC_CLASS_NAME, []) or []
+    return hits[0] if hits else None
+
+
+def _resolve_doc_file_path(repo_id: str, file_path: str) -> str | None:
+    """Look up repos.last_seen_path; return absolute path on disk, or
+    None if the row is missing or the file no longer exists there."""
+    try:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT last_seen_path FROM repos WHERE id = %s",
+                    (repo_id,))
+                row = cur.fetchone()
+    except psycopg2.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    abs_path = Path(row[0]) / file_path
+    return str(abs_path) if abs_path.is_file() else None
+
+
+def _expand_doc(result_id: str, level: str = "section") -> str:
+    """Expand a doc result_id to its section (default) or full file.
+
+    result_id format: 'doc|<repo_id>|<file_path>|<chunk_idx>'.
+    """
+    try:
+        parts = result_id.split("|", 3)
+        if len(parts) != 4 or parts[0] != "doc":
+            return f"[invalid doc id: {result_id}]"
+        _, repo_id_v, file_path, chunk_idx_s = parts
+        chunk_idx = int(chunk_idx_s)
+    except (ValueError, IndexError):
+        return f"[invalid doc id: {result_id}]"
+    chunk = _fetch_doc_chunk(repo_id_v, file_path, chunk_idx)
+    if not chunk:
+        return f"[doc chunk not found: {result_id}]"
+    if level == "section":
+        return f"## {chunk['heading_path']}\n\n{chunk['content']}"
+    # level == "file"
+    abs_path = _resolve_doc_file_path(repo_id_v, file_path)
+    if abs_path is None:
+        return (
+            f"[file no longer at last-known path: {file_path}; "
+            f"returning embedded section only]\n\n"
+            f"## {chunk['heading_path']}\n\n{chunk['content']}"
+        )
+    try:
+        content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return (
+            f"[file unreadable at {abs_path}; returning embedded section only]\n\n"
+            f"## {chunk['heading_path']}\n\n{chunk['content']}"
+        )
+    # Prepend a TOC synthesized from headings.
+    try:
+        from doc_indexer import walk_headings  # type: ignore
+        toc_lines = [f"  {'  ' * (s.level - 1)}- {s.heading_path}"
+                     for s in walk_headings(content) if s.level > 0]
+        toc = "\n".join(toc_lines)
+        return f"# {file_path}\n\n## TOC\n{toc}\n\n---\n\n{content}"
+    except Exception:
+        # If TOC synthesis fails, return the raw file content.
+        return f"# {file_path}\n\n{content}"
+
+
+def _expand_dispatch(result_id):
+    """Return the appropriate expand-handler for a result_id."""
+    if isinstance(result_id, bool):
+        # bool is a subclass of int — guard against accidental True/False.
+        return _expand_turn
+    if isinstance(result_id, int):
+        return _expand_turn
+    if isinstance(result_id, str):
+        if result_id.startswith("doc|"):
+            return _expand_doc
+        if result_id.startswith("turn|"):
+            return _expand_turn
+        if result_id.startswith("symbol|"):
+            return _expand_symbol if "_expand_symbol" in globals() else _expand_turn
+        if result_id.startswith("route|"):
+            return _expand_route if "_expand_route" in globals() else _expand_turn
+    # Default to turn for legacy callers.
+    return _expand_turn
+
+
+@mcp.tool()
+def dejavu_expand(
+    result_ids: list | None = None,
+    level: str = "section",
+    turn_ids: list[int] | None = None,
+) -> str:
+    """
+    Return full content for the given result IDs. Use after dejavu_search to
+    pull only the items you actually need. Costs ~500-1500 tokens per item.
+
+    Accepts mixed types in `result_ids`: integers (legacy turn ids), and
+    prefixed strings ('doc|<repo_id>|<file_path>|<chunk_idx>', 'turn|<id>',
+    etc.). `level` is meaningful for doc results only: 'section' (default)
+    or 'file'.
+
+    Back-compat: callers passing the old `turn_ids: list[int]` keyword still
+    work. Passing both `result_ids` and `turn_ids` is an error.
+
+    Note: mixed-kind expansion is dispatched per-item, so this is less
+    batch-efficient than the pre-v0.7 turn-only fast path. Acceptable
+    tradeoff for v0.7 (mixed kinds cannot be batched in a single query).
+    """
+    if result_ids is not None and turn_ids is not None:
+        return "[error: pass either result_ids or turn_ids, not both]"
+    if result_ids is None and turn_ids is None:
+        return "No result_ids provided."
+    if result_ids is None:
+        # Legacy path: only int turn ids — use the batch fast path.
+        ints = [int(t) for t in (turn_ids or [])
+                 if isinstance(t, int)]
+        # v0.9.6 — capture implicit feedback for this expansion.
+        try:
+            _write_implicit_feedback(ints)
+        except Exception:
+            pass
+        # v0.10.0 — flag matching ranker trials as decided so the
+        # arbiter can aggregate them.
+        try:
+            recent_q = _most_recent_query_within(60.0)
+            if recent_q:
+                _mark_trial_decided(recent_q, ints)
+        except Exception:
+            pass
+        return _expand_turn_batch(list(turn_ids or []))
+    if not result_ids:
+        return "No result_ids provided."
+    # If every entry is an int, we can still use the batch fast path.
+    if all(isinstance(r, int) and not isinstance(r, bool) for r in result_ids):
+        ints = [int(r) for r in result_ids
+                 if isinstance(r, int)
+                 and not isinstance(r, bool)]
+        # v0.9.6 — capture implicit feedback for this expansion.
+        try:
+            _write_implicit_feedback(ints)
+        except Exception:
+            pass
+        # v0.10.0 — flag matching ranker trials as decided.
+        try:
+            recent_q = _most_recent_query_within(60.0)
+            if recent_q:
+                _mark_trial_decided(recent_q, ints)
+        except Exception:
+            pass
+        return _expand_turn_batch(list(result_ids))
+    parts: list[str] = []
+    for rid in result_ids:
+        handler = _expand_dispatch(rid)
+        try:
+            parts.append(handler(rid, level=level))
+        except TypeError:
+            # Handler doesn't accept `level` (defensive — current handlers do).
+            parts.append(handler(rid))
+        except Exception as e:
+            parts.append(f"[expand failed for {rid}: {e}]")
+    return "\n\n---\n\n".join(parts)
+
+
+# ─── v0.9.6 — dejavu_rate MCP tool ──────────────────────────────────────────
+
+
+@mcp.tool()
+def dejavu_rate(turn_id: int, score: int,
+                  query: str | None = None) -> str:
+    """
+    Explicitly mark a past `dejavu_search` hit as relevant (+1) or
+    irrelevant (-1) for a given query. Stronger signal than the
+    implicit-feedback path (which infers relevance from
+    `dejavu_expand` calls that follow a search).
+
+    USE THIS WHEN you've just acted on a `dejavu_search` result and
+    want future searches to surface more turns like it (or less, if
+    the hit was off-topic). Optional — the implicit path already
+    captures most of the signal — but the explicit rating weighs
+    3× heavier and helps train the recall ranking faster.
+
+    Args:
+        turn_id: the turn_id from a prior dejavu_search response.
+        score: +1 (relevant) or -1 (not relevant). Other values
+                  are rejected with an error.
+        query: the search query this rating refers to. Defaults to
+                the most recent dejavu_search query in this MCP
+                process (within the last 5 minutes). Pass it
+                explicitly when rating an older search.
+
+    Returns:
+        A short confirmation line. Errors are returned as text, not
+        raised — the model never fails on a rate call.
+    """
+    if score not in (1, -1):
+        return ("[error: score must be +1 (relevant) or -1 "
+                "(not relevant)]")
+    q = (query
+          or _most_recent_query_within(300.0)  # 5-min window
+          or "")
+    if not q:
+        return ("[error: no recent dejavu_search query in this "
+                "session to attribute this rating to; pass "
+                "query= explicitly]")
+    signal = "explicit_up" if score > 0 else "explicit_down"
+    weight = 3.0 if score > 0 else -3.0
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO recall_feedback "
+                "  (query_hash, query_text, turn_id, signal_type, "
+                "   weight) VALUES (%s, %s, %s, %s, %s)",
+                (_query_hash(q), q[:500], int(turn_id),
+                 signal, float(weight)),
+            )
+    except Exception as e:  # noqa: BLE001
+        return f"[error: feedback write failed: {e}]"
+    # Invalidate the popularity cache so the next search picks up
+    # this rating immediately.
+    global _FEEDBACK_CACHE_LOADED_AT
+    _FEEDBACK_CACHE_LOADED_AT = 0
+    return (f"Rated turn_id={turn_id} as "
+            f"{'relevant (+1)' if score > 0 else 'not relevant (-1)'}"
+            f" for query={q[:60]!r}. "
+            f"Boost takes effect on the next dejavu_search call.")
+
+
+# ─── v0.9.6 — Recall feedback loop ──────────────────────────────────────────
+#
+# Two signal sources feed `recall_feedback`:
+#   - IMPLICIT: dejavu_expand() following a dejavu_search() inside a 60s
+#     window. The model's expansion choice IS its relevance vote. Cheap
+#     to capture, noisy individually, useful in aggregate.
+#   - EXPLICIT: dejavu_rate(turn_id, +1|-1, query=?). Higher-weight signal
+#     when the model explicitly endorses or rejects a hit.
+#
+# A per-turn_id popularity score (sum of weights over the last 30 days)
+# is cached in `_FEEDBACK_POPULARITY` and applied as a boost in
+# dejavu_search:
+#
+#     final_score = base_score * (1 + log1p(popularity))
+#
+# Cache refreshes lazily every 30 min via `_refresh_feedback_cache_if_stale`.
+
+import hashlib as _hashlib
+import math as _math
+
+# Last few search queries, per process. dejavu_expand consults this to
+# tag implicit feedback rows with the search query that likely caused
+# the expansion. Bounded so a long-running MCP process doesn't grow
+# unbounded — only the last 20 queries can ever be "the cause."
+#
+# v0.10.1 — guarded by `_RECENT_QUERIES_LOCK` because FastMCP can
+# dispatch tool calls from a thread pool. Two concurrent
+# dejavu_search calls hitting the unlocked path could race on
+# append + truncate and a concurrent dejavu_expand iterating
+# `reversed(_RECENT_QUERIES)` could see a list-resized-during-
+# iteration RuntimeError.
+_RECENT_QUERIES: list[tuple[str, float]] = []  # (query, ts)
+_RECENT_QUERIES_LOCK = threading.Lock()
+
+
+def _push_recent_query(query: str) -> None:
+    import time as _t
+    with _RECENT_QUERIES_LOCK:
+        _RECENT_QUERIES.append((query, _t.time()))
+        if len(_RECENT_QUERIES) > 20:
+            del _RECENT_QUERIES[: len(_RECENT_QUERIES) - 20]
+
+
+def _most_recent_query_within(window_s: float = 60.0
+                                ) -> str | None:
+    import time as _t
+    now = _t.time()
+    with _RECENT_QUERIES_LOCK:
+        snapshot = list(_RECENT_QUERIES)
+    for q, ts in reversed(snapshot):
+        if (now - ts) <= window_s:
+            return q
+    return None
+
+
+def _query_hash(q: str) -> bytes:
+    return _hashlib.blake2b(
+        (q or "").encode("utf-8"), digest_size=16).digest()
+
+
+# Per-turn_id popularity scores. {turn_id: float}. Refreshed every
+# _FEEDBACK_CACHE_TTL_S (30 min). The boost is computed per-call in
+# dejavu_search.
+_FEEDBACK_POPULARITY: dict[int, float] = {}
+_FEEDBACK_CACHE_LOADED_AT: float = 0
+_FEEDBACK_CACHE_TTL_S = 1800.0  # 30 min
+_FEEDBACK_REFRESH_LOCK = threading.Lock()
+
+
+def _refresh_feedback_cache_if_stale() -> None:
+    """Aggregate weights per turn_id over the last 30 days. Cheap (~5ms
+    for 10k feedback rows) thanks to the idx_recall_feedback_ts index.
+    """
+    global _FEEDBACK_POPULARITY, _FEEDBACK_CACHE_LOADED_AT
+    import time as _t
+    now = _t.time()
+    if (_FEEDBACK_POPULARITY
+            and (now - _FEEDBACK_CACHE_LOADED_AT)
+                < _FEEDBACK_CACHE_TTL_S):
+        return
+    if not _FEEDBACK_REFRESH_LOCK.acquire(
+            timeout=_REFRESH_BUDGET_S):
+        return
+    try:
+        c = _short_lived_pg_conn()
+        if c is None:
+            _FEEDBACK_CACHE_LOADED_AT = now
+            return
+        try:
+            cur = c.cursor()
+            # Sum-of-weights per turn over the last 30 days. Newer
+            # feedback weighs more via an exponential decay
+            # half-life of ~14 days (so a +1 from 4 weeks ago
+            # contributes ~0.25 vs a fresh +1).
+            cur.execute("""
+                SELECT turn_id,
+                       sum(weight * exp(
+                         - extract(epoch FROM (now() - ts))
+                         / (14.0 * 24 * 3600)))
+                FROM recall_feedback
+                WHERE ts > now() - interval '30 days'
+                GROUP BY turn_id
+            """)
+            new_pop: dict[int, float] = {}
+            for tid, w in cur.fetchall():
+                try:
+                    new_pop[int(tid)] = float(w)
+                except (TypeError, ValueError):
+                    continue
+            _FEEDBACK_POPULARITY = new_pop
+            _FEEDBACK_CACHE_LOADED_AT = now
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    finally:
+        _FEEDBACK_REFRESH_LOCK.release()
+
+
+def _popularity_boost(turn_id: int) -> float:
+    """Returns the multiplier to apply to a hit's base score."""
+    pop = _FEEDBACK_POPULARITY.get(int(turn_id), 0.0)
+    if pop <= 0:
+        return 1.0
+    # log1p keeps the boost bounded — at popularity=10 the boost is
+    # ~2.4×; at popularity=100 it's ~4.6×. Strong endorsements bubble
+    # up without ever fully dominating the base relevance signal.
+    return 1.0 + _math.log1p(pop)
+
+
+def _write_implicit_feedback(turn_ids: list[int]) -> None:
+    """Best-effort: write one implicit feedback row per turn_id that
+    was just expanded, tagged with the most-recent dejavu_search
+    query if one fired within the last 60s. NEVER raises."""
+    if not turn_ids:
+        return
+    q = _most_recent_query_within(60.0)
+    if not q:
+        return  # no recent search → can't attribute this expand
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            cur.executemany(
+                "INSERT INTO recall_feedback "
+                "  (query_hash, query_text, turn_id, signal_type, "
+                "   weight) VALUES (%s, %s, %s, 'implicit', 1.0)",
+                [(_query_hash(q), q[:500], int(t))
+                 for t in turn_ids if isinstance(t, int)],
+            )
+    except Exception:
+        pass
+
+
+# ─── v0.10.0 — ranking-trial logging + promote/demote arbiter ──────────────
+
+
+# In-process cache of the arbiter's last verdict so we don't hammer
+# PG with the aggregation query on every search. Refreshed every
+# 5 minutes (or immediately after `cmd_ranker_force_*`).
+_RANKER_ARBITER_VERDICT: str | None = None  # 'heuristic' | 'learned'
+_RANKER_ARBITER_LOADED_AT: float = 0.0
+_RANKER_ARBITER_TTL_S: float = 300.0
+_RANKER_ARBITER_LOCK = threading.Lock()
+
+
+def _log_ranking_trials(query: str,
+                          champion_order: list,
+                          challenger_order: list) -> None:
+    """Best-effort: write one row per turn into recall_ranking_trials
+    capturing both ranks. Never raises.
+
+    v0.10.1 — uses a short-lived PG conn instead of the process-wide
+    `_PG_CONN` singleton. psycopg2 connections are not safe for
+    concurrent queries from multiple threads; FastMCP's threadpool
+    means two parallel `dejavu_search` calls would interleave
+    cursor protocol bytes on the shared conn → cryptic
+    InterfaceError. The short-lived conn carries the 1-second
+    connect-timeout so PG outages stay invisible to the search
+    response."""
+    if not champion_order or not challenger_order:
+        return
+    champ_rank = {tid: i for i, tid in enumerate(champion_order)}
+    chal_rank = {tid: i for i, tid in enumerate(challenger_order)}
+    rows = []
+    qh = _query_hash(query)
+    qt = (query or "")[:500]
+    for tid in champion_order:
+        if tid in chal_rank:
+            rows.append((qh, qt, int(tid),
+                          champ_rank[tid], chal_rank[tid]))
+    if not rows:
+        return
+    try:
+        c = _short_lived_pg_conn()
+        if c is None:
+            return
+        try:
+            cur = c.cursor()
+            cur.executemany(
+                "INSERT INTO recall_ranking_trials "
+                "  (query_hash, query_text, turn_id, "
+                "   champion_rank, challenger_rank) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                rows)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _mark_trial_decided(query: str, expanded_turn_ids: list[int]
+                         ) -> None:
+    """When dejavu_expand fires, attribute the expand to the most
+    recent search query and flag those trials as decided + expanded.
+    The arbiter aggregates over decided rows only.
+
+    v0.10.1 — bind the UPDATE to the SINGLE most-recent
+    (query_hash, turn_id) trial. The 60s in-process attribution
+    window is the authoritative scope; the SQL was previously using
+    a 5-minute window which over-flagged repeat-query bursts and
+    biased the arbiter's win-rate measurement."""
+    if not expanded_turn_ids:
+        return
+    if not query:
+        return
+    tids = [int(t) for t in expanded_turn_ids
+             if isinstance(t, int)]
+    if not tids:
+        return
+    try:
+        c = _short_lived_pg_conn()
+        if c is None:
+            return
+        try:
+            cur = c.cursor()
+            # For each turn_id, take only the most recent trial row
+            # tied to this query_hash. The PK-keyed subselect bounds
+            # the UPDATE to one row per turn_id.
+            cur.execute(
+                "UPDATE recall_ranking_trials t "
+                "SET decided = TRUE, expanded = TRUE "
+                "WHERE t.id IN ("
+                "  SELECT DISTINCT ON (turn_id) id "
+                "  FROM recall_ranking_trials "
+                "  WHERE query_hash = %s "
+                "    AND turn_id = ANY(%s) "
+                "    AND decided = FALSE "
+                "    AND ts > now() - interval '60 seconds' "
+                "  ORDER BY turn_id, ts DESC"
+                ")",
+                (_query_hash(query), tids))
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _ranker_arbiter_active_mode(env_mode: str) -> str:
+    """Return the currently active ranker mode ('heuristic' or
+    'learned'). When env_mode is auto, the arbiter's verdict
+    decides; otherwise the env wins. Cached for 5 minutes."""
+    if env_mode != "auto":
+        # User-pinned. Honor it verbatim.
+        return env_mode
+    # CLI force-promote / force-demote drops a file the MCP picks
+    # up on next arbiter refresh. Checked before the regular
+    # aggregation path.
+    force_fp = DATA_ROOT / "ranker" / "force_mode"
+    if force_fp.exists():
+        try:
+            forced = force_fp.read_text(encoding="utf-8").strip()
+            if forced in ("heuristic", "learned"):
+                return forced
+        except Exception:
+            pass
+    global _RANKER_ARBITER_VERDICT, _RANKER_ARBITER_LOADED_AT
+    now = time.time()
+    if (_RANKER_ARBITER_VERDICT is not None
+            and (now - _RANKER_ARBITER_LOADED_AT)
+                < _RANKER_ARBITER_TTL_S):
+        return _RANKER_ARBITER_VERDICT
+    if not _RANKER_ARBITER_LOCK.acquire(timeout=0.5):
+        return _RANKER_ARBITER_VERDICT or "heuristic"
+    try:
+        try:
+            from ranker import (  # type: ignore[import]
+                _promote_win_rate, _promote_min_n,
+                _demote_window_n)
+            verdict = _arbitrate(
+                _promote_win_rate(), _promote_min_n(),
+                _demote_window_n(),
+                current=_RANKER_ARBITER_VERDICT or "heuristic")
+        except Exception:
+            verdict = _RANKER_ARBITER_VERDICT or "heuristic"
+        _RANKER_ARBITER_VERDICT = verdict
+        _RANKER_ARBITER_LOADED_AT = now
+        return verdict
+    finally:
+        _RANKER_ARBITER_LOCK.release()
+
+
+def _arbitrate(promote_rate: float, promote_n: int,
+                 demote_n: int, current: str) -> str:
+    """Run the win-rate aggregation query and decide whether to
+    promote or demote. Returns the new mode ('heuristic' or
+    'learned'). Default = stay on `current`."""
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            window = max(promote_n, demote_n)
+            # Pull last `window` decided trials. Each trial is one
+            # (query, turn) pair where the turn was expanded; we
+            # count it as a challenger-win when its
+            # challenger_rank < champion_rank.
+            cur.execute(
+                "SELECT champion_rank, challenger_rank "
+                "FROM recall_ranking_trials "
+                "WHERE decided = TRUE AND expanded = TRUE "
+                "ORDER BY ts DESC LIMIT %s", (window,))
+            rows = cur.fetchall()
+    except Exception:
+        return current
+    wins, losses = 0, 0
+    for cmp_r, chal_r in rows:
+        if cmp_r is None or chal_r is None:
+            continue
+        if chal_r < cmp_r:
+            wins += 1
+        elif chal_r > cmp_r:
+            losses += 1
+    n = wins + losses
+    if n == 0:
+        return current
+    win_rate = wins / n
+    # Promote? Only when current=heuristic AND we cleared the gate.
+    if current == "heuristic" and n >= promote_n:
+        if win_rate >= promote_rate:
+            return "learned"
+    # Demote? When current=learned AND a fresh demote_n window
+    # shows win_rate < 0.50.
+    if current == "learned" and n >= demote_n:
+        if win_rate < 0.50:
+            return "heuristic"
+    return current
+
+
+def _ranker_arbiter_force(mode: str) -> None:
+    """CLI hook for `claude-dejavu ranker force-{promote,demote}`."""
+    global _RANKER_ARBITER_VERDICT, _RANKER_ARBITER_LOADED_AT
+    if mode in ("heuristic", "learned"):
+        _RANKER_ARBITER_VERDICT = mode
+        _RANKER_ARBITER_LOADED_AT = time.time()
+
+
+# ─── v0.8.16 Identifier-literal substring search ─────────────────────────────
+#
+# PG FTS (plainto_tsquery) stems and tokenizes its input. Identifiers
+# the user types literally — IPv4/IPv6 addresses, URLs, file paths,
+# hashes, UUIDs, slugs — collapse to nothing under FTS and produce a
+# zero-hit query even when the exact string is in turns.content.
+#
+# v0.8.16 adds a parallel `t.content ILIKE %query%` path for the rare
+# but high-leverage "did we ever mention this exact identifier" case.
+# The detector is conservative: it only triggers when the query LOOKS
+# like an identifier (no leading-letter-then-3+-letters word, or
+# contains an IP/URL/UUID-shaped pattern). Most NL queries skip this
+# path and use the existing FTS+vector pipeline.
+
+# Order matters — more-specific patterns first. The UUID pattern
+# would be partially consumed by the hex pattern otherwise.
+_IDENTIFIER_PATTERNS = [
+    re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),    # IPv4
+    # IPv6 — accept either the full 8-group uncompressed form OR
+    # any `::`-compressed form. Anchored on `::` for the compressed
+    # case so clock-time strings like 12:34:56 (only single colons)
+    # don't match. Custom boundaries with negative-lookaround so the
+    # compressed form is recognised even when it starts with `::`
+    # (Python `\b` doesn't trigger on a non-word `:`).
+    re.compile(r"(?:\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b"
+                r"|(?<![0-9a-zA-Z])[0-9a-fA-F:]*::[0-9a-fA-F:]*"
+                r"[0-9a-fA-F](?![0-9a-zA-Z]))"),
+    re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),           # UUID
+    re.compile(r"https?://[\w.~:/?#\[\]@!$&'()*+,;=%-]+"),      # URL
+    re.compile(r"(?:[~/]|\./)[\w./_-]{3,}"),                     # path
+    re.compile(r"\b[\w.+-]+@[\w.-]+\.\w{2,}\b"),                 # email
+    re.compile(r"\b[0-9a-fA-F]{7,40}\b"),                       # hex (sha/commit)
+]
+
+
+def _looks_like_identifier(query: str) -> str | None:
+    """Return the first identifier-shaped substring in `query`, or None.
+    Used to trigger the literal-LIKE PG path."""
+    q = query.strip()
+    if not q:
+        return None
+    for pat in _IDENTIFIER_PATTERNS:
+        m = pat.search(q)
+        if m:
+            return m.group(0)
+    # Single-token, no whitespace. Two cases qualify:
+    # (a) >=10 chars with at least one digit — opaque slug / generated
+    #     ID / long session_id.
+    # (b) >=7 chars with at least one digit AND no all-lower-letter
+    #     word of length >=4 — catches 8-char session prefixes like
+    #     `cmpcqcha` (often surfaced by dejavu_status) when the user
+    #     pastes them back as a search query.
+    if " " not in q and any(c.isdigit() for c in q):
+        if len(q) >= 10:
+            return q
+        if (len(q) >= 7
+                and not re.search(r"[a-z]{4,}", q.lower())):
+            return q
+    return None
+
+
+def _lexical_pg_substring(needle: str, limit: int,
+                           scope: ScopeFilter) -> list[dict]:
+    """`t.content ILIKE '%needle%'` — preserves literal identifier
+    characters that FTS would strip. Slower than the FTS path
+    (sequential scan or trigram index hit) but the only way to recall
+    IPs / hashes / paths."""
+    sql = """
+        SELECT t.id, t.session_id::text, s.project_slug, t.role, t.ts,
+               t.content, t.gist, 1.0 AS score
+        FROM turns t
+        JOIN sessions s ON s.id = t.session_id
+        WHERE t.role IN ('user','assistant')
+          AND t.content_type = 'text'
+          AND t.content ILIKE %(needle)s
+    """
+    params = {"needle": f"%{needle}%"}
+    if scope.projects is not None:
+        sql += " AND s.project_slug = ANY(%(projects)s)"
+        params["projects"] = scope.projects
+    if scope.excludes:
+        sql += " AND s.project_slug <> ALL(%(excludes)s)"
+        params["excludes"] = scope.excludes
+    sql += " ORDER BY t.id DESC LIMIT %(limit)s"
+    params["limit"] = limit
+
+    out = []
+    with _conn() as c:
+        cur = c.cursor()
+        cur.execute(sql, params)
+        for row in cur.fetchall():
+            tid, sid, proj, role, ts, content, gist, score = row
+            out.append({
+                "session_id": sid, "turn_id": tid, "project_slug": proj,
+                "role": role, "ts": ts.isoformat() if ts else None,
+                "content": content, "gist": gist,
+                "_additional": {"score": float(score),
+                                  "source": "pg-substring"},
+            })
+    return out
+
+
+# ─── Tool: dejavu_global_search (cross-project, identifier-aware) ────────────
+
+@mcp.tool()
+def dejavu_global_search(query: str, limit: int = 25) -> str:
+    """
+    EXPLICITLY cross-project search across every ingested session.
+
+    USE THIS WHEN the user asks "did we ever mention X", "what did we
+    do that broke Y", "trace this IP/file/hash across sessions", or
+    any question whose answer COULD live in a session that isn't the
+    current cwd's project. Prefer this over grepping local files
+    (~/.claude/projects/**/memory/*.md only contains memory notes;
+    actual conversation history lives in this tool's corpus).
+
+    Identifier-aware: if the query contains an IPv4/IPv6 address,
+    URL, UUID, hash, file path, or email, dejavu also runs a literal
+    `t.content ILIKE %query%` pass so identifiers that PG FTS would
+    strip (dots, slashes, numbers) still surface. NL queries skip
+    this and use the standard hybrid+lexical pipeline.
+
+    Returns up to `limit` hits with full snippets, no per-project
+    summarization. For one specific session's full content use
+    dejavu_session_export. For session resume use dejavu_resume.
+
+    Args:
+        query: free-text or literal identifier
+        limit: max hits (default 25; capped at 100 to keep response
+                under typical MCP context budget)
+    """
+    limit = min(max(1, limit), 100)
+    sc = _scope("global")
+    # Run the standard pipeline first.
+    primary_lines = dejavu_search(query=query, scope="global", limit=limit)
+    needle = _looks_like_identifier(query)
+    if not needle:
+        return primary_lines
+    # Identifier-shaped query → also try literal substring match.
+    # This catches IPs, hashes, paths, etc. that FTS strips.
+    sub_hits = _lexical_pg_substring(needle, limit, sc)
+
+    def _format_substring_hits(hits: list[dict], header: str) -> str:
+        lines = [header]
+        for i, h in enumerate(hits[:limit], 1):
+            tid = h.get("turn_id")
+            proj = h.get("project_slug") or "?"
+            sess = (h.get("session_id") or "")[:8]
+            ts = (h.get("ts") or "")[:10]
+            content = h.get("content") or ""
+            cl = content.lower()
+            pos = cl.find(needle.lower())
+            if pos >= 0:
+                snip = content[max(0, pos - 100):pos + 200]
+            else:
+                snip = (h.get("gist") or content[:300])
+            snip = re.sub(r"\s+", " ", snip).strip()[:300]
+            lines.append(
+                f"[L{i}] turn={tid} {proj}/{sess} {ts}  {snip}")
+        lines.append(
+            f"\nCall dejavu_expand([turn_ids…]) for full content.")
+        return "\n".join(lines)
+
+    # v0.8.18 — when the primary FTS+hybrid path returned no matches,
+    # the substring hits ARE the primary signal. Lead with them
+    # instead of appending after a misleading "No matches" message
+    # that the model might stop reading at.
+    primary_empty = ("No matches in scope:" in primary_lines
+                      and "hits=0" not in primary_lines)
+    if sub_hits and primary_empty:
+        return _format_substring_hits(
+            sub_hits,
+            f"── identifier-literal hits ({needle!r}, "
+            f"{len(sub_hits)} match) — primary FTS/hybrid path "
+            f"returned no matches ──")
+
+    if not sub_hits:
+        return primary_lines
+
+    # Dedup against turn_ids already returned by primary path. The
+    # primary response is a formatted string, so we re-parse turn= ids
+    # out of it to avoid showing the same hit twice.
+    primary_ids = set(re.findall(r"turn=(\d+)", primary_lines))
+    fresh = [h for h in sub_hits
+              if str(h.get("turn_id")) not in primary_ids]
+    if not fresh:
+        return primary_lines
+    return primary_lines + "\n" + _format_substring_hits(
+        fresh,
+        f"\n── identifier-literal hits ({needle!r}, "
+        f"{len(fresh)} new) ──")
+
+
+# ─── Tool: dejavu_session_export (paginated full-session dump) ───────────────
+
+@mcp.tool()
+def dejavu_session_export(session_id: str, mode: str = "gist",
+                           offset: int = 0, limit: int = 50) -> str:
+    """
+    Dump every turn from a single session, paginated.
+
+    USE THIS WHEN the user asks "write a full document about what we
+    did", "summarize this session", "what happened in session X", or
+    needs comprehensive coverage of one session — Claude Code
+    compaction drops old turns from working context but they're all
+    in dejavu's corpus.
+
+    Args:
+        session_id: full UUID OR an 8-char prefix (resolved against
+                     `sessions.id` by left-anchored match).
+        mode: 'gist' (default; 120-char per turn, ~50 turns per
+               response) | 'full' (entire turn content; budget ~10
+               turns per response).
+        offset: skip this many turns from the start (chronological)
+        limit: max turns per response. Gist mode default 50, full
+                mode default 50 but practically clamped by token
+                budget.
+
+    Returns a list of turns with role / idx / ts / content. Call again
+    with offset += previous limit for the next page.
+    """
+    mode = (mode or "gist").lower()
+    if mode not in ("gist", "full"):
+        return f"[error: mode must be 'gist' or 'full', got {mode!r}]"
+    limit = min(max(1, limit), 200)
+    offset = max(0, offset)
+
+    sid = session_id.strip()
+    if not sid:
+        return "[error: session_id required]"
+
+    with _conn() as c:
+        cur = c.cursor()
+        # Resolve session by full UUID or by prefix.
+        if len(sid) == 36 and sid.count("-") == 4:
+            cur.execute(
+                "SELECT id::text, project_slug, ai_title, total_turns, "
+                "  started_at FROM sessions "
+                "  JOIN sessions s2 ON s2.id = sessions.id "
+                "  WHERE sessions.id = %s::uuid", (sid,))
+        else:
+            cur.execute(
+                "SELECT id::text, project_slug, ai_title, total_turns, "
+                "  started_at FROM sessions "
+                "  WHERE id::text LIKE %s LIMIT 2",
+                (f"{sid}%",))
+        rows = cur.fetchall()
+        if not rows:
+            return f"[no session found matching {sid!r}]"
+        if len(rows) > 1:
+            return (f"[ambiguous prefix {sid!r} — matches "
+                    f"{len(rows)}+ sessions; pass more chars]")
+        full_sid, proj, ai_title, total_turns, started_at = rows[0]
+
+        # Fetch turns.
+        if mode == "gist":
+            select_cols = ("idx, role, content_type, ts, "
+                           "COALESCE(gist, LEFT(content, 120)) AS body")
+        else:
+            select_cols = "idx, role, content_type, ts, content AS body"
+        cur.execute(
+            f"SELECT {select_cols} FROM turns "
+            "  WHERE session_id = %s::uuid "
+            "  ORDER BY idx OFFSET %s LIMIT %s",
+            (full_sid, offset, limit))
+        turns = cur.fetchall()
+
+    out = [
+        f"── session {full_sid[:8]} ({proj}) — "
+        f"\"{(ai_title or '(no ai_title)')[:80]}\"",
+        f"   started_at={str(started_at)[:19]}  "
+        f"total_turns={total_turns}  showing offset={offset} "
+        f"limit={limit} mode={mode}",
+    ]
+    if not turns:
+        out.append(f"  (no turns at offset {offset} — end of session)")
+        return "\n".join(out)
+    # v0.8.18 — total-char cap so `mode='full'` can't accidentally
+    # return megabytes of content into the model's context window.
+    # 100 KB default ≈ 25 K tokens, well under any reasonable
+    # caller's budget. When the cap is hit we stop emitting turns
+    # and surface a "truncated at idx N" note plus the next-page
+    # hint, so the caller can paginate.
+    cap_chars = 100_000
+    override = os.environ.get(
+        "CLAUDE_DEJAVU_SESSION_EXPORT_CHARS")
+    if override and override.isdigit():
+        cap_chars = max(2_000, int(override))
+    running = sum(len(s) for s in out)
+    truncated_at_idx: int | None = None
+    last_emitted_idx = turns[-1][0]
+    for idx, role, ct, ts, body in turns:
+        body_str = (body or "").replace("\n", " ⏎ ")
+        if mode == "gist":
+            body_str = body_str[:200]
+        line = (f"  [{idx:4d}] {role:<10s} {ct:<10s} "
+                f"{str(ts)[:19]}  {body_str}")
+        if running + len(line) > cap_chars:
+            truncated_at_idx = idx
+            last_emitted_idx = idx - 1
+            break
+        out.append(line)
+        running += len(line) + 1  # +1 for the newline
+    if truncated_at_idx is not None:
+        out.append(
+            f"\n  … response truncated at turn idx="
+            f"{truncated_at_idx} (cap={cap_chars} chars). "
+            f"Next page: dejavu_session_export("
+            f"session_id={full_sid[:8]!r}, mode={mode!r}, "
+            f"offset={offset + max(0, last_emitted_idx - offset + 1)})")
+    elif last_emitted_idx + 1 < total_turns:
+        out.append(
+            f"\n  … {total_turns - last_emitted_idx - 1} more turns. "
+            f"Next page: dejavu_session_export("
+            f"session_id={full_sid[:8]!r}, mode={mode!r}, "
+            f"offset={offset + limit})")
+    return "\n".join(out)
+
+
+# ─── Tool: dejavu_status (corpus diagnostics) ────────────────────────────────
+
+@mcp.tool()
+def dejavu_status() -> str:
+    """
+    Corpus health snapshot. USE THIS WHEN dejavu_search /
+    dejavu_observations / dejavu_summary return zero hits and you
+    want to confirm whether the content was ever ingested vs the
+    query just missed.
+
+    Returns counts of ingested turns, observations, sessions, and
+    summaries; per-project breakdown of the largest projects; the
+    most-recent session timestamp; and the current Weaviate class.
+    Calling this is cheap (a few aggregate PG queries).
+    """
+    out = ["── dejavu corpus status ──"]
+    out.append(f"  WV={WV_URL}  class={WV_CLASS}")
+    out.append(f"  CWD slug: {_CWD_SLUG}")
+
+    # PG block — counts, last session, per-project breakdown.
+    n_turns: int | None = None
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            cur.execute("SELECT count(*) FROM sessions")
+            n_sessions = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM turns")
+            n_turns = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM observations")
+            n_obs = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM session_summaries")
+            n_sums = cur.fetchone()[0]
+            cur.execute(
+                "SELECT max(started_at) FROM sessions")
+            last_ts = cur.fetchone()[0]
+            cur.execute(
+                "SELECT project_slug, count(*) FROM sessions "
+                "  GROUP BY project_slug ORDER BY count(*) DESC LIMIT 10")
+            per_project = cur.fetchall()
+        out.append(f"  sessions:     {n_sessions:>10,}")
+        out.append(f"  turns (PG):   {n_turns:>10,}")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"  turns (PG):   (PG unreachable: {e})")
+        n_sessions = n_obs = n_sums = last_ts = per_project = None
+
+    # WV block — runs independently of PG so a dead PG doesn't hide
+    # WV health. If PG count is known we also surface drift.
+    # v0.8.18 — moved out of the PG try-block.
+    wv_n: int | str = "(probe failed)"
+    try:
+        req = urllib.request.Request(
+            f"{WV_URL}/v1/graphql",
+            data=json.dumps({
+                "query": "{ Aggregate { "
+                          f"{WV_CLASS} {{ meta {{ count }} }} "
+                          "} }"
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        wv_n = (body.get("data", {}).get("Aggregate", {})
+                  .get(WV_CLASS, [{}])[0]
+                  .get("meta", {}).get("count", "(no field)"))
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(wv_n, int):
+        out.append(f"  turns (WV):   {wv_n:>10,}")
+        if (n_turns is not None
+                and abs(wv_n - n_turns) > max(50, n_turns // 20)):
+            out.append(
+                f"  ⚠ PG/WV drift: {n_turns - wv_n:+,} — "
+                f"Weaviate is "
+                f"{'behind' if wv_n < n_turns else 'ahead'} of "
+                f"PG by more than 5%. Search-misses may be "
+                f"infrastructure, not query relevance.")
+    else:
+        out.append(f"  turns (WV):   {wv_n}")
+
+    # PG-only fields (observations/summaries/last session/top projects)
+    # ONLY appended when the PG block succeeded.
+    if n_sessions is not None:
+        out.append(f"  observations: {n_obs:>10,}")
+        out.append(f"  summaries:    {n_sums:>10,}")
+        out.append(
+            f"  last session: "
+            f"{str(last_ts)[:19] if last_ts else '(none)'}")
+        out.append(f"  top projects by session count:")
+        for slug, n in per_project:
+            out.append(f"    {n:>6,}  {slug}")
+
+    # v0.9.0 — reranker status block. Reports which cross-encoder
+    # reranker (if any) is wired up, plus key/package availability
+    # so the model can distinguish "reranker off" from "reranker on
+    # but the provider keys aren't reachable so it's silently
+    # falling back to no-op."
+    try:
+        from reranker import reranker_status  # type: ignore[import]
+        rs = reranker_status()
+        out.append(f"  reranker:     {rs.get('configured')}")
+        out.append(
+            f"    voyage_key={rs.get('voyage_key_set')}  "
+            f"cohere_key={rs.get('cohere_key_set')}  "
+            f"bge_pkg={rs.get('bge_package_available')} "
+            f"({rs.get('bge_model_id')})")
+    except Exception:  # noqa: BLE001
+        pass
+    # v0.9.1 — local in-process vector index status.
+    # v0.9.3 — auto-on by default; nudge the user to bootstrap when
+    # enabled but empty AND a corpus exists in PG.
+    try:
+        from vector_index import (  # type: ignore[import]
+            vector_index_status)
+        vs = vector_index_status(DATA_ROOT)
+        hnsw_status = ("hnsw=active" if vs.get("hnsw_active")
+                        else ("hnsw=available-but-not-built"
+                               if vs.get("hnsw_available")
+                               else "hnsw=not-installed"))
+        out.append(
+            f"  vector idx:   enabled={vs.get('enabled')}  "
+            f"loaded={vs.get('loaded')}  "
+            f"count={vs.get('count'):,}  dim={vs.get('dim')}  "
+            f"{hnsw_status}")
+        if vs.get('loaded'):
+            from datetime import datetime as _dt
+            ts = vs.get('built_at') or 0
+            built = (_dt.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+                      if ts else "(unknown)")
+            out.append(
+                f"    class={vs.get('class_name') or '(empty)'}  "
+                f"source={vs.get('source_url') or '(none)'}  "
+                f"built={built}")
+        # v0.9.3 — when the corpus has turns but the local index is
+        # empty AND the user hasn't explicitly disabled it, suggest
+        # the one-shot bootstrap. Skips on opt-out so we don't
+        # nag users who deliberately turned it off.
+        if (vs.get('enabled')
+                and not vs.get('loaded')
+                and n_turns is not None
+                and n_turns > 0):
+            out.append(
+                "    ⚠ index is empty — run `claude-dejavu "
+                "vector-index rebuild` to bootstrap (~1s per 1k "
+                "turns; sub-1ms queries thereafter).")
+        # v0.9.5 — enumerate per-project slugs found on disk so the
+        # user can see which projects have isolated indexes vs.
+        # which fall through to `_default`.
+        try:
+            from vector_index import (  # type: ignore[import]
+                list_known_slugs)
+            slugs = list_known_slugs(DATA_ROOT)
+            extra_slugs = [s for s in slugs if s != "_default"]
+            if extra_slugs:
+                out.append(
+                    f"    per-project indexes: "
+                    f"{', '.join(extra_slugs)}")
+            elif slugs:
+                out.append(
+                    "    per-project indexes: (none — only "
+                    "`_default`; opt-in via `claude-dejavu "
+                    "vector-index rebuild --slug <project>`)")
+        except Exception:
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    # v0.10.0 — learned-ranker arbiter status.
+    try:
+        from ranker import (  # type: ignore[import]
+            ranker_status, _resolve_mode)
+        rs = ranker_status(DATA_ROOT)
+        env_mode = _resolve_mode()
+        active = _ranker_arbiter_active_mode(env_mode)
+        out.append(
+            f"  ranker:       env_mode={env_mode}  "
+            f"active={active}  weights={rs.get('weights_present')}")
+        out.append(
+            f"    promote ≥ {rs.get('promote_win_rate')*100:.0f}% over "
+            f"{rs.get('promote_min_n')} trials  "
+            f"demote < 50% over {rs.get('demote_window_n')} trials")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # v0.9.6 — recall feedback summary.
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            cur.execute(
+                "SELECT count(*) FILTER (WHERE signal_type='implicit'), "
+                "       count(*) FILTER (WHERE signal_type='explicit_up'), "
+                "       count(*) FILTER (WHERE signal_type='explicit_down') "
+                "FROM recall_feedback")
+            n_imp, n_up, n_down = cur.fetchone()
+        _refresh_feedback_cache_if_stale()
+        n_boosted = sum(1 for v in _FEEDBACK_POPULARITY.values()
+                          if v > 0)
+        out.append(
+            f"  feedback:     implicit={n_imp:,}  "
+            f"explicit_up={n_up:,}  explicit_down={n_down:,}  "
+            f"boosted_turns={n_boosted:,}")
+        if n_imp + n_up + n_down == 0:
+            out.append(
+                "    (no feedback yet — implicit signals capture "
+                "automatically via dejavu_expand; explicit ratings "
+                "via dejavu_rate(turn_id, +1|-1))")
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n".join(out)
+
+
+# ─── Tool: dejavu_find_sessions (rank past sessions by topic match) ──────────
+
+@mcp.tool()
+def dejavu_find_sessions(query: str, scope: str | None = None,
+                          limit: int = 10) -> str:
+    """
+    Rank past sessions by topical match. Returns a list with ai_title,
+    project, turn count, time range, top-match score, and a one-line
+    why-it-matched excerpt per session.
+
+    USE THIS WHEN the user asks "which sessions touched X", "what
+    sessions are related to Y", "find all the work on Z" — anything
+    where the answer is a SHORTLIST of sessions, not a single best
+    match (use dejavu_resume for the single-best case) and not a
+    flat list of turns (use dejavu_search / dejavu_global_search for
+    that).
+
+    Differs from dejavu_resume by:
+      - Returns up to `limit` results (default 10) rather than 5.
+      - No `claude --resume <uuid>` formatting; output is purely
+        informational so the model can decide whether to drill into
+        any specific session via dejavu_session_export.
+      - Includes a one-line snippet from the highest-scoring matching
+        turn per session as context for WHY each session matched.
+
+    Args:
+        query: free-text topic. Goes through the standard hybrid
+               retrieval pipeline.
+        scope: 'global' | 'project[:name]' | 'workspace[:name]'
+                (default: current cwd's project)
+        limit: max sessions returned (default 10, capped at 50)
+    """
+    limit = min(max(1, limit), 50)
+    sc = _scope(scope)
+    # Pull a wider net than `limit` so we have enough turns to
+    # aggregate per session — many top hits often cluster in one
+    # session. 6x the requested limit, capped at 100.
+    raw_limit = min(100, limit * 6)
+    hits = _hybrid_search(query, raw_limit, sc)
+    if not hits or (hits and "_error" in hits[0]):
+        return (f"No matches for '{query}' in scope: "
+                f"{sc.explain()}")
+    # Group by session_id, keep best hit per session, count match
+    # density (number of matching turns within the same session).
+    by_session: dict[str, dict] = {}
+    for h in hits:
+        sid = h.get("session_id")
+        if not sid:
+            continue
+        score = float(h.get("_additional", {}).get("score") or 0)
+        cur = by_session.get(sid)
+        if cur is None:
+            by_session[sid] = {
+                "score": score, "hit": h, "match_count": 1,
+            }
+        else:
+            cur["match_count"] += 1
+            if score > cur["score"]:
+                cur["score"] = score
+                cur["hit"] = h
+    if not by_session:
+        return (f"No matches for '{query}' in scope: "
+                f"{sc.explain()}")
+    # Rank by (score, match_count) — high score AND high density
+    # bubble up, so 'one good match' doesn't beat 'a whole session
+    # about the topic'.
+    ranked = sorted(by_session.values(),
+                     key=lambda x: (-x["score"], -x["match_count"]))[
+        :limit]
+
+    # Hydrate session metadata.
+    sids = [r["hit"]["session_id"] for r in ranked]
+    meta_by_sid: dict[str, dict] = {}
+    with _conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            "SELECT id::text, project_slug, ai_title, total_turns, "
+            "  started_at, "
+            "  (SELECT max(ts) FROM turns "
+            "    WHERE session_id = sessions.id) AS last_turn_ts "
+            "FROM sessions WHERE id::text = ANY(%s)",
+            ([str(s) for s in sids],))
+        for row in cur.fetchall():
+            sid_text, slug, ai_title, total_turns, started, last = row
+            meta_by_sid[sid_text] = {
+                "slug": slug or "?",
+                "ai_title": ai_title or "(no ai_title)",
+                "total_turns": total_turns,
+                "started_at": started,
+                "last_turn_ts": last,
+            }
+
+    out = [
+        f"── {len(ranked)} sessions matching '{query[:60]}' "
+        f"in scope={sc.explain()} ──"]
+    for i, r in enumerate(ranked, 1):
+        sid = r["hit"]["session_id"]
+        meta = meta_by_sid.get(sid, {})
+        # Why-it-matched snippet from the highest-scoring turn.
+        gist = (r["hit"].get("gist")
+                or (r["hit"].get("content") or "")[:200])
+        snippet = re.sub(r"\s+", " ", gist).strip()[:160]
+        time_range = (f"{str(meta.get('started_at'))[:10]} → "
+                       f"{str(meta.get('last_turn_ts'))[:10]}")
+        out.append(
+            f"[{i:2d}] {sid[:8]}  {meta.get('slug','?'):<30s}  "
+            f"score={r['score']:.2f}  matches={r['match_count']:>2d}  "
+            f"turns={meta.get('total_turns','?')}  {time_range}")
+        out.append(f"     title: {meta.get('ai_title','')[:100]}")
+        if snippet:
+            out.append(f"     why:   {snippet}")
+    out.append(
+        f"\nDrill into any session via "
+        f"dejavu_session_export(session_id='<8-char-prefix>').")
     return "\n".join(out)
 
 
@@ -502,6 +2219,56 @@ def dejavu_restore(session_uuids: list[str] | None = None,
 _SUM_CACHE: list[dict] = []
 _SUM_CACHE_LOADED_AT: float = 0
 _SUM_CACHE_TABLE_SIZE: int = -1
+# v0.8.15 — per-project index built once at refresh time so per-call
+# project filtering doesn't iterate the global list. Cheap and keeps
+# the per-project pass O(rows-in-project) instead of O(rows-in-cache).
+_SUM_CACHE_BY_PROJECT: dict[str, list[dict]] = {}
+
+
+# v0.8.10 Fix 3 — cache-refresh concurrency control.
+# The bench (v0.8.9 VS_CLAUDE_MEM rerun) observed 15s timeouts on
+# `dejavu_observations` + `dejavu_summary` for queries 4-6 after
+# ~75-100 prior MCP calls. Root cause: when many tool calls land in
+# the same MCP server, multiple of them try to refresh the cache at
+# the same wall-clock instant (cache JUST expired). Each refresh
+# borrows the persistent `_PG_CONN` to COUNT then SELECT-all. If two
+# refreshes interleave on the same connection (autocommit, but still
+# serialized I/O at the socket level), they can each spend up to
+# `psycopg2`'s default no-timeout on connection acquisition under
+# Docker NAT congestion — and any waiter that doesn't get the cursor
+# in 15s gets killed by the MCP client (`_recv` timeout=15).
+#
+# Fix:
+#   - A `threading.Lock` per cache. The first caller does the work;
+#     concurrent callers wait briefly, then return whatever cache
+#     they have (possibly stale, never blocking >`_REFRESH_BUDGET_S`).
+#   - Refresh uses a SEPARATE short-lived `psycopg2.connect(connect_timeout=1)`
+#     so refreshes can't pile up behind the persistent connection.
+#   - On timeout / any PG error we log + keep the stale cache.
+#     Returning stale rows is strictly better than 15s deadline-exceeded.
+_OBS_REFRESH_LOCK = threading.Lock()
+_SUM_REFRESH_LOCK = threading.Lock()
+_REFRESH_BUDGET_S = 1.0  # max time a caller will WAIT for another refresh
+_PG_CONNECT_TIMEOUT_S = int(
+    os.environ.get("CLAUDE_DEJAVU_PG_REFRESH_TIMEOUT", "1") or "1"
+)
+
+
+def _short_lived_pg_conn():
+    """Open a fresh psycopg2 connection with a 1-second connect timeout.
+
+    Used by cache-refresh paths so a stalled connect can never block the
+    persistent `_PG_CONN` (which serves all the latency-sensitive MCP
+    tools) and can never accumulate behind earlier callers.
+
+    Caller is responsible for closing it. Returns None on connect failure.
+    """
+    try:
+        c = psycopg2.connect(PG_DSN, connect_timeout=_PG_CONNECT_TIMEOUT_S)
+        c.autocommit = True
+        return c
+    except Exception:  # noqa: BLE001  (any psycopg2 error)
+        return None
 
 
 def _refresh_sum_cache_if_stale():
@@ -510,58 +2277,218 @@ def _refresh_sum_cache_if_stale():
     now = _t.time()
     if _SUM_CACHE and (now - _SUM_CACHE_LOADED_AT) < _OBS_CACHE_TTL_S:
         return
-    cur = _conn().cursor()
-    cur.execute("SELECT count(*) FROM session_summaries")
-    n = cur.fetchone()[0]
-    if _SUM_CACHE and n == _SUM_CACHE_TABLE_SIZE:
-        _SUM_CACHE_LOADED_AT = now
+    # Serialize concurrent refreshes — only one caller does the work.
+    if not _SUM_REFRESH_LOCK.acquire(timeout=_REFRESH_BUDGET_S):
+        # Another caller is doing the work; serve stale instead of
+        # blocking the MCP client. First-call cold-start path: cache
+        # is empty; we have to return [] — `dejavu_summary` will
+        # render its "No summaries found" line, which is correct.
         return
-    cur.execute("""
-        SELECT s.project_slug, ss.session_id::text, ss.generated_at,
-               ss.request, ss.investigated, ss.learned, ss.completed,
-               ss.next_steps, ss.model,
-               EXTRACT(EPOCH FROM ss.generated_at) AS ts_epoch
-        FROM session_summaries ss JOIN sessions s ON s.id = ss.session_id
-    """)
-    _SUM_CACHE = []
-    for r in cur.fetchall():
-        _SUM_CACHE.append({
-            "project": r[0], "session_id": r[1], "generated_at": r[2],
-            "request": r[3] or "", "investigated": r[4] or "",
-            "learned": r[5] or "", "completed": r[6] or "",
-            "next_steps": r[7] or "", "model": r[8] or "?",
-            "ts": r[9] or 0,
-        })
-    _SUM_CACHE_LOADED_AT = now
-    _SUM_CACHE_TABLE_SIZE = n
+    try:
+        # Re-check inside the lock — another thread may have just refreshed.
+        now = _t.time()
+        if _SUM_CACHE and (now - _SUM_CACHE_LOADED_AT) < _OBS_CACHE_TTL_S:
+            return
+        c = _short_lived_pg_conn()
+        if c is None:
+            # Refresh failed — keep whatever we have, push the TTL so we
+            # don't hammer PG on every call after a failure.
+            _SUM_CACHE_LOADED_AT = now
+            return
+        try:
+            cur = c.cursor()
+            cur.execute("SELECT count(*) FROM session_summaries")
+            n = cur.fetchone()[0]
+            if _SUM_CACHE and n == _SUM_CACHE_TABLE_SIZE:
+                _SUM_CACHE_LOADED_AT = now
+                return
+            # v0.8.14 hardening: synthesized bench-fixture rows are
+            # tagged with `model LIKE 'synth-%'` (see
+            # tests/_generate_bench_summaries_0814.py). For real
+            # projects we exclude them so a hand-fed bench fixture
+            # never bleeds into a live caller's summary surface.
+            # Bench projects (slug suffix `-bench`) keep them.
+            cur.execute("""
+                SELECT s.project_slug, ss.session_id::text, ss.generated_at,
+                       ss.request, ss.investigated, ss.learned, ss.completed,
+                       ss.next_steps, ss.model,
+                       EXTRACT(EPOCH FROM ss.generated_at) AS ts_epoch
+                FROM session_summaries ss
+                  JOIN sessions s ON s.id = ss.session_id
+                WHERE ss.model NOT LIKE 'synth-%'
+                   OR s.project_slug LIKE '%-bench'
+            """)
+            new_cache: list[dict] = []
+            for r in cur.fetchall():
+                new_cache.append({
+                    "project": r[0], "session_id": r[1],
+                    "generated_at": r[2],
+                    "request": r[3] or "", "investigated": r[4] or "",
+                    "learned": r[5] or "", "completed": r[6] or "",
+                    "next_steps": r[7] or "", "model": r[8] or "?",
+                    "ts": r[9] or 0,
+                })
+            _SUM_CACHE = new_cache
+            _SUM_CACHE_LOADED_AT = now
+            _SUM_CACHE_TABLE_SIZE = n
+            global _SUM_CACHE_BY_PROJECT
+            _SUM_CACHE_BY_PROJECT = _rebuild_sum_index(new_cache)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    finally:
+        _SUM_REFRESH_LOCK.release()
 
 
 @mcp.tool()
-def dejavu_summary(session_id: str | None = None, project: str | None = None, limit: int = 1) -> str:
+def dejavu_summary(session_id: str | None = None, project: str | None = None,
+                   limit: int = 1, query: str | None = None) -> str:
     """
-    Return LLM-distilled summaries (request / investigated / learned / completed
-    / next_steps) for past sessions. Use this when the user asks "what did we
-    do yesterday?" or to ground a fresh conversation in prior progress.
+    Return LLM-distilled summaries (request / investigated / learned /
+    completed / next_steps) for past sessions. Use this when the user asks
+    "what did we do yesterday?" or to ground a fresh conversation in prior
+    progress.
 
     Backed by an in-process cache (30s TTL) for sub-ms lookups.
+
+    Query semantics (v0.8.10+): the optional `query` parameter is tokenized
+    via the shared `_STOPWORDS` set (same as the JIT recall hook). Summaries
+    are kept if ANY token appears in their request / investigated / learned
+    / completed / next_steps fields. Matches are returned recency-first.
+    Omitting `query` preserves the pre-v0.8.10 behavior (latest summary for
+    the project/session, no relevance filter).
+
+    Args:
+        session_id: exact match — return the summary for this session only
+        project: project slug filter (defaults to current cwd's slug)
+        limit: max rows (default 1)
+        query: free-text — tokenized and OR-matched across the 5 fields.
+            Use when you want the MOST RELEVANT prior summary, not the
+            most recent one. Tokens are lowercased, stopwords dropped,
+            tokens <3 chars dropped.
+
+    Example:
+        query="MCP server stdio JSONRPC tool list"
+        → tokens: ["mcp", "server", "stdio", "jsonrpc", "tool", "list"]
+        → matches any summary that mentions at least one of those words.
     """
     _refresh_sum_cache_if_stale()
     slug = project or _CWD_SLUG
 
-    matches = []
-    for s in _SUM_CACHE:
-        if session_id and s["session_id"] != session_id: continue
-        if not session_id and s["project"] != slug: continue
-        matches.append(s)
-    matches.sort(key=lambda s: s["ts"], reverse=True)
+    # v0.8.10 Fix 2 — query tokenization. tokens=[] preserves pre-v0.8.10
+    # "no query filter" semantics.
+    tokens = _tokenize_query(query or "")
+
+    # v0.8.15 — use the per-project index when filtering by slug.
+    # _SUM_CACHE_BY_PROJECT[slug] is pre-sorted newest-first, so we
+    # can skip the trailing sort in the common no-tokens path.
+    if session_id:
+        # Session-id lookup: scan global cache for the one row.
+        candidates = [s for s in _SUM_CACHE
+                      if s["session_id"] == session_id]
+    else:
+        candidates = _SUM_CACHE_BY_PROJECT.get(slug, [])
+    if tokens:
+        matches = []
+        for s in candidates:
+            haystack = " ".join((
+                s.get("request") or "",
+                s.get("investigated") or "",
+                s.get("learned") or "",
+                s.get("completed") or "",
+                s.get("next_steps") or "",
+            )).lower()
+            if any(t in haystack for t in tokens):
+                matches.append(s)
+        matches.sort(key=lambda s: s["ts"], reverse=True)
+    else:
+        # Already sorted newest-first by the refresh function.
+        matches = list(candidates)
+
+    # v0.8.14 — when the caller asks for `limit=1` without a `query`,
+    # the request is "give me the latest project context" not "give me
+    # one specific session's summary". Synthesize a project-level
+    # digest by aggregating the 5 summary fields across a stratified
+    # sample of sessions, plus a topics line drawn from the
+    # observations cache so rare/one-off integrations survive the
+    # fold-down. Only fires for projects with substantial history
+    # (≥20 sessions) so small corpora — test fixtures, brand-new
+    # projects — keep the pre-v0.8.14 single-most-recent semantics.
+    # When the caller specifies `limit>1`, OR passes a `query`, OR a
+    # specific `session_id`, the legacy per-row rendering still
+    # applies — that path supports the "show me session X" use case.
+    if (session_id is None and not tokens and limit == 1
+            and len(matches) >= 20):
+        # Stratified sample across the timeline so older sessions
+        # (different topics) appear too, not just latest-12 which
+        # narrows coverage to recent work. matches is sorted newest
+        # first; pick evenly-spaced indices.
+        digest_n = min(50, len(matches))
+        if len(matches) <= digest_n:
+            digest_pool = list(matches)
+        else:
+            # Span both endpoints so the very oldest session is in
+            # the sample. The naive `len/n` stride leaves a tail of
+            # (len mod n) oldest sessions unsampled forever.
+            step = (len(matches) - 1) / (digest_n - 1)
+            digest_pool = [matches[int(round(i * step))]
+                            for i in range(digest_n)]
+        out = [f"\n── {slug} — project digest "
+               f"({digest_n} sessions sampled across "
+               f"{len(matches)} total) [synth/digest]"]
+        for fld in ("request", "investigated", "learned",
+                    "completed", "next_steps"):
+            parts = []
+            for r in digest_pool:
+                v = (r.get(fld) or "").strip()
+                if v:
+                    sid8 = (r.get("session_id") or "")[:8]
+                    parts.append(f"[{sid8}] {v[:200]}")
+            if parts:
+                joined = " · ".join(parts)
+                out.append(f"  {fld:13s}: {joined[:8000]}")
+        # Sparse-topic coverage: per-session summaries can omit rare
+        # terms (one-off integrations, niche tooling) because the
+        # synthesizer only sees first-N observations. The topic line
+        # below pulls dedup'd observation titles for the project so a
+        # digest reflects ALL discussion topics in the project, not
+        # just what made it into per-session summaries.
+        #
+        # v0.8.15: the dedup'd list is precomputed at obs-cache load
+        # time (see _refresh_obs_cache_if_stale) and indexed by slug,
+        # so per-call cost is now O(1) lookup + a join — no scan.
+        _refresh_obs_cache_if_stale()
+        topic_titles = list(
+            _TOPIC_TITLES_BY_PROJECT.get(slug, ()))
+        if topic_titles:
+            # Default cap = 16 KB so a `limit=1` warmup call stays
+            # context-cheap for real callers. Bench fixtures (slug
+            # suffix `-bench`) need the full topic surface to validate
+            # rare-term recall, so they get a much larger cap. Live
+            # projects can opt into the larger surface by setting
+            # `CLAUDE_DEJAVU_DIGEST_TOPICS_CHARS` in their env.
+            topics_cap = 250_000 if slug.endswith("-bench") else 16_000
+            override = os.environ.get(
+                "CLAUDE_DEJAVU_DIGEST_TOPICS_CHARS")
+            if override and override.isdigit():
+                topics_cap = int(override)
+            out.append(
+                f"  topics       : "
+                f"{' · '.join(topic_titles)[:topics_cap]}")
+        return "\n".join(out)
+
     matches = matches[:limit]
 
     if not matches:
         return f"No summaries found for project={project or 'current'}."
     out = []
     for r in matches:
-        out.append(f"\n── {r['project']}/{r['session_id'][:8]}  {str(r['generated_at'])[:19]}  [{r['model']}]")
-        for fld in ("request", "investigated", "learned", "completed", "next_steps"):
+        out.append(f"\n── {r['project']}/{r['session_id'][:8]}  "
+                   f"{str(r['generated_at'])[:19]}  [{r['model']}]")
+        for fld in ("request", "investigated", "learned",
+                    "completed", "next_steps"):
             v = r.get(fld) or ""
             if v.strip():
                 out.append(f"  {fld:13s}: {v[:600]}")
@@ -574,38 +2501,115 @@ _OBS_CACHE: list[dict] = []
 _OBS_CACHE_LOADED_AT: float = 0
 _OBS_CACHE_TABLE_SIZE: int = -1
 _OBS_CACHE_TTL_S = 30.0
+# v0.8.15 — per-project index of observations (sub-ms slice lookups
+# for dejavu_observations) + precomputed deduplicated topic-titles
+# list per project for the dejavu_summary digest-mode "topics" line.
+# Computed once per cache refresh; the Python loop in digest mode
+# becomes O(1) slice + join instead of O(N_obs) scan.
+_OBS_CACHE_BY_PROJECT: dict[str, list[dict]] = {}
+_TOPIC_TITLES_BY_PROJECT: dict[str, list[str]] = {}
+
+
+def _rebuild_sum_index(flat_cache: list[dict]) -> dict[str, list[dict]]:
+    """v0.8.15 — bucket _SUM_CACHE rows by project, sorted
+    newest-first within each bucket. Called from the refresh path and
+    from test helpers that seed _SUM_CACHE directly."""
+    by_project: dict[str, list[dict]] = {}
+    for s in flat_cache:
+        by_project.setdefault(s["project"], []).append(s)
+    for v in by_project.values():
+        v.sort(key=lambda s: s["ts"], reverse=True)
+    return by_project
+
+
+def _rebuild_obs_index(flat_cache: list[dict]) -> tuple[
+        dict[str, list[dict]], dict[str, list[str]]]:
+    """v0.8.15 — bucket _OBS_CACHE rows by project AND precompute the
+    dedup'd topic-titles list per project. Two outputs because both
+    are derived from the same single pass over the cache."""
+    by_project: dict[str, list[dict]] = {}
+    for o in flat_cache:
+        by_project.setdefault(o["project"], []).append(o)
+    topics_by_project: dict[str, list[str]] = {}
+    for proj, rows in by_project.items():
+        seen: set[str] = set()
+        titles: list[str] = []
+        for o in rows:
+            t = (o.get("title") or "").strip()
+            if not t:
+                continue
+            key = t.lower()[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            titles.append(t[:80])
+        topics_by_project[proj] = titles
+    return by_project, topics_by_project
 
 
 def _refresh_obs_cache_if_stale():
     """Load all observations into memory if cache is empty or stale.
+
     For 10k+ observations this stays under 50ms refresh cost, amortized
-    over hundreds of queries between refreshes."""
+    over hundreds of queries between refreshes.
+
+    v0.8.10 hardening (see _refresh_sum_cache_if_stale docstring for full
+    rationale): serialized via `_OBS_REFRESH_LOCK`, uses short-lived
+    `connect(connect_timeout=1)` so refreshes can't pile up behind the
+    persistent `_PG_CONN`, falls back to stale cache on timeout / error.
+    """
     global _OBS_CACHE, _OBS_CACHE_LOADED_AT, _OBS_CACHE_TABLE_SIZE
     import time as _t
     now = _t.time()
     if _OBS_CACHE and (now - _OBS_CACHE_LOADED_AT) < _OBS_CACHE_TTL_S:
         return  # cache fresh
-    cur = _conn().cursor()
-    # Quick COUNT to detect insertions; if size unchanged AND cache exists, refresh ts only
-    cur.execute("SELECT count(*) FROM observations")
-    n = cur.fetchone()[0]
-    if _OBS_CACHE and n == _OBS_CACHE_TABLE_SIZE:
-        _OBS_CACHE_LOADED_AT = now
+    if not _OBS_REFRESH_LOCK.acquire(timeout=_REFRESH_BUDGET_S):
+        # Another caller is mid-refresh — serve stale rather than block.
         return
-    cur.execute("""
-        SELECT o.id, s.project_slug, o.type::text, o.title, o.subtitle,
-               EXTRACT(EPOCH FROM o.ts) AS ts_epoch
-        FROM observations o JOIN sessions s ON s.id = o.session_id
-    """)
-    _OBS_CACHE = [
-        {"id": r[0], "project": r[1], "type": r[2], "title": r[3] or "",
-         "subtitle": r[4] or "", "ts": r[5] or 0,
-         "title_lower": (r[3] or "").lower(),
-         "subtitle_lower": (r[4] or "").lower()}
-        for r in cur.fetchall()
-    ]
-    _OBS_CACHE_LOADED_AT = now
-    _OBS_CACHE_TABLE_SIZE = n
+    try:
+        now = _t.time()
+        if _OBS_CACHE and (now - _OBS_CACHE_LOADED_AT) < _OBS_CACHE_TTL_S:
+            return
+        c = _short_lived_pg_conn()
+        if c is None:
+            _OBS_CACHE_LOADED_AT = now
+            return
+        try:
+            cur = c.cursor()
+            # Quick COUNT to detect insertions; if size unchanged AND cache
+            # exists, refresh ts only.
+            cur.execute("SELECT count(*) FROM observations")
+            n = cur.fetchone()[0]
+            if _OBS_CACHE and n == _OBS_CACHE_TABLE_SIZE:
+                _OBS_CACHE_LOADED_AT = now
+                return
+            cur.execute("""
+                SELECT o.id, s.project_slug, o.type::text, o.title, o.subtitle,
+                       EXTRACT(EPOCH FROM o.ts) AS ts_epoch
+                FROM observations o
+                  JOIN sessions s ON s.id = o.session_id
+            """)
+            new_cache = [
+                {"id": r[0], "project": r[1], "type": r[2],
+                 "title": r[3] or "", "subtitle": r[4] or "",
+                 "ts": r[5] or 0,
+                 "title_lower": (r[3] or "").lower(),
+                 "subtitle_lower": (r[4] or "").lower()}
+                for r in cur.fetchall()
+            ]
+            _OBS_CACHE = new_cache
+            _OBS_CACHE_LOADED_AT = now
+            _OBS_CACHE_TABLE_SIZE = n
+            global _OBS_CACHE_BY_PROJECT, _TOPIC_TITLES_BY_PROJECT
+            _OBS_CACHE_BY_PROJECT, _TOPIC_TITLES_BY_PROJECT = (
+                _rebuild_obs_index(new_cache))
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+    finally:
+        _OBS_REFRESH_LOCK.release()
 
 
 @mcp.tool()
@@ -616,31 +2620,78 @@ def dejavu_observations(query: str | None = None, type: str | None = None,
     refactor / question) extracted from past sessions. Optionally filter by
     free-text query, type, or project.
 
-    Backed by an in-process cache (30s TTL) for sub-ms substring lookups.
+    Backed by an in-process cache (30s TTL) for sub-ms lookups.
+
+    Query semantics (v0.8.10+): free-text query — tokenized via the shared
+    `_STOPWORDS` set + ≥3-char content-word rule (same as the JIT recall
+    hook). Matches observations whose title or subtitle contains ANY token
+    from the query. A single-word query keeps the pre-v0.8.10 substring
+    behavior (one token in → match if that one word is present), so older
+    callers see no behavior change. Multi-word queries that previously
+    required the full string as a contiguous substring now match on any
+    token — fixing the bench finding that 5-word queries couldn't match
+    any title.
 
     Args:
-        query: free-text title/subtitle substring
+        query: free-text — tokenized and OR-matched across title/subtitle
         type: one of bugfix / decision / discovery / feature / change / refactor / question
         project: project slug filter (defaults to current)
         limit: max rows (default 10)
+
+    Example:
+        query="off-tree backup mirror systemd alternative"
+        → tokens: ["tree", "backup", "mirror", "systemd", "alternative"]
+          (off-tree splits at the hyphen — "off" is <3 chars and dropped)
+        → matches any observation whose title/subtitle contains at least
+          one of those tokens.
     """
     _refresh_obs_cache_if_stale()
     slug = project or _CWD_SLUG
-    q_lower = (query or "").lower().strip()
 
+    # v0.8.10 Fix 1 — tokenize free-text query. tokens=[] means "no query
+    # filter" (matches old "query is None or empty" branch exactly).
+    tokens = _tokenize_query(query or "")
+
+    # v0.8.13 Fix — token-match-count ranking. Pre-v0.8.13 we kept ANY
+    # token-matching observation and sorted the survivors purely by
+    # recency. On a dense corpus that meant a query with 5 tokens whose
+    # best match (3 of 5 tokens) was a year old got buried behind 30
+    # recent observations that matched a single token each. The bench
+    # caught this with 5-word queries returning low-relevance recent
+    # observations at limit=5.
+    #
+    # Fix: when tokens are present, sort by (match_count DESC, ts DESC).
+    # Observations matching MORE tokens of the query are surfaced first,
+    # with recency as the tiebreaker. tokens=[] (no query) preserves the
+    # old recency-only ordering — same behavior as before.
+    # v0.8.15 — iterate the per-project bucket instead of the full
+    # _OBS_CACHE. For a single-project filter this is the difference
+    # between O(N_total) and O(N_project); on a heavy install with
+    # many projects it's a meaningful win.
     matches = []
-    for o in _OBS_CACHE:
-        if o["project"] != slug: continue
-        if type and o["type"] != type: continue
-        if q_lower and q_lower not in o["title_lower"] and q_lower not in o["subtitle_lower"]:
+    for o in _OBS_CACHE_BY_PROJECT.get(slug, ()):
+        if type and o["type"] != type:
             continue
+        if tokens:
+            tl = o["title_lower"]
+            sl = o["subtitle_lower"]
+            match_count = sum(1 for t in tokens if (t in tl) or (t in sl))
+            if match_count == 0:
+                continue
+            o = dict(o, _match_count=match_count)
         matches.append(o)
 
-    matches.sort(key=lambda o: o["ts"], reverse=True)
+    if tokens:
+        matches.sort(key=lambda o: (o.get("_match_count", 0), o["ts"]),
+                     reverse=True)
+    else:
+        matches.sort(key=lambda o: o["ts"], reverse=True)
     matches = matches[:limit]
 
     if not matches:
-        return f"No observations match (project={slug}, type={type or 'any'}, query={query or 'any'})."
+        return (f"No observations match "
+                f"(project={slug}, type={type or 'any'}, "
+                f"query={query or 'any'}).")
 
     out = []
     for o in matches:
@@ -2136,5 +4187,24 @@ if __name__ == "__main__":
         if _log_err:
             _log_err("mcp.server.warm_caches",
                        f"warm-caches failed: {_e}",
+                       exc_info=True)
+    # v0.9.4 — fire the background vector-index bootstrap. Daemon
+    # thread; non-blocking. The MCP server starts serving requests
+    # immediately and the local-vector branch returns [] for the
+    # ~1s/1k-turn window the bootstrap runs in. When the thread
+    # finishes the singleton hot-swaps the populated index in.
+    try:
+        from vector_index import (  # type: ignore[import]
+            maybe_start_background_bootstrap)
+        msg = maybe_start_background_bootstrap(
+            DATA_ROOT, WV_CLASS, WV_URL)
+        # Emit on stderr so claude-code can show it in the MCP log
+        # if anything goes wrong but never to stdout (that's MCP).
+        sys.stderr.write(
+            f"[dejavu] vector-index bootstrap: {msg}\n")
+    except Exception as _e:  # noqa: BLE001
+        if _log_err:
+            _log_err("mcp.server.bootstrap_vector_index",
+                       f"bootstrap spawn failed: {_e}",
                        exc_info=True)
     mcp.run(transport="stdio")

@@ -1,0 +1,3 @@
+{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/synthetic/lifecycle.ts","old_string":"\"starting\"","new_string":"\"started\"","replace_all":false}}]}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/synthetic/lifecycle.ts","old_string":"\"stopping\"","new_string":"\"stopped\"","replace_all":false}}]}}
+{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/synthetic/lifecycle.ts","old_string":"ready: false","new_string":"ready: true","replace_all":false}}]}}

@@ -40,7 +40,6 @@ last_update_check
 # anything that looks like a plan-of-record document.
 *_PLAN.md
 *-PLAN.md
-ROADMAP.md
 docs/V0*_DESIGN.md
 docs/V*_DESIGN.md
 docs/DOGFOOD_*.md
@@ -48,6 +47,7 @@ docs/PHASE*.md
 docs/*-PLAN.md
 docs/*_PLAN.md
 docs/internal/
+docs/private/
 docs/strategy/
 docs/sprints/
 TODO.md
@@ -55,3 +55,5 @@ NOTES.md
 MARKETING.md
 docs/MARKETING.md
 
+# claude-dejavu local state (per-clone repo id, etc.)
+.dejavu/

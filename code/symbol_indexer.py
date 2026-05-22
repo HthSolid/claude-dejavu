@@ -1237,7 +1237,7 @@ def index_project(
 # ─── Resolution / lookup ─────────────────────────────────────────────────────
 
 
-# ─── Resolver tuning constants (informed by sofinexus dogfood, n=21385) ──────
+# ─── Resolver tuning constants (informed by internal dogfood, n=21385) ──────
 #
 # DEFAULT_TRIGRAM_THRESHOLD: pg_trgm similarity_threshold. At 0.3 (the v0.3.0
 # default) 75% of obvious hallucinations matched something. At 0.4 zero of
@@ -1266,7 +1266,7 @@ def _rerank_score(query: str, name: str, qualified_name: str | None,
     """Combine pg_trgm similarity with length-aware + substring + edit-distance
     heuristics.
 
-    Tuning informed by sofinexus dogfood failures:
+    Tuning informed by internal dogfood failures:
       * `parseUser` -> `parser` (sim=0.70 because trigrams of 'parser' are
         subset of 'parseUser').
       * `RuleService` -> `pageRulesService` (long substring win).
@@ -1374,7 +1374,7 @@ def resolve_symbol(
         # forces a sequential scan over the entire symbols table (~170ms on a
         # 21k-row corpus, 19× slower than necessary). The `%` operator catches
         # exact matches anyway because similarity('X','X') = 1.0 always passes
-        # the threshold. Verified via EXPLAIN ANALYZE during sofinexus dogfood.
+        # the threshold. Verified via EXPLAIN ANALYZE during internal dogfood.
         sql = f"""
             SELECT id, project_slug, file_path, language, kind, name, qualified_name,
                    signature, start_line, end_line, parent_symbol_id, doc,

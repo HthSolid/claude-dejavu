@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Local-CI gate for `git push`. Bypass: HTE_SKIP_LOCAL_CI=1 git push
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+if [ "${HTE_SKIP_LOCAL_CI:-${DEJAVU_SKIP_LOCAL_CI:-0}}" = "1" ]; then
+  printf '[pre-push] HTE_SKIP_LOCAL_CI=1 — bypassing local CI gate\n' >&2
+  exit 0
+fi
+
+# Skip if only pushing tags (no branch refs in stdin)
+only_tags=1
+while read -r local_ref _ _ _; do
+  case "$local_ref" in refs/tags/*|"") ;; *) only_tags=0 ;; esac
+done
+[ "$only_tags" = "1" ] && exit 0
+
+mode="fast"
+[ "${HTE_FULL_LOCAL_CI:-${DEJAVU_FULL_LOCAL_CI:-0}}" = "1" ] && mode="all"
+
+printf '[pre-push] running local CI (%s) — set HTE_SKIP_LOCAL_CI=1 to bypass\n' "$mode" >&2
+exec ./scripts/local-ci.sh "$mode"

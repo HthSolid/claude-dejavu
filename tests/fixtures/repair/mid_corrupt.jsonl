@@ -1,0 +1,6 @@
+{"parentUuid":null,"uuid":"a","type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hi"},"sessionId":"s1","cwd":"/t"}
+{"parentUuid":"a","uuid":"b","type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"model":"claude"},"sessionId":"s1","cwd":"/t"}
+{"parentUuid":"b","uuid":"c","type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"bye"},"sessionId":"s1","cwd":"/t"}
+{"corrupt_line_in_the_middle
+{"parentUuid":"c","uuid":"d","type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude"},"sessionId":"s1","cwd":"/t"}
+{"parentUuid":"d","uuid":"e","type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"thanks"},"sessionId":"s1","cwd":"/t"}

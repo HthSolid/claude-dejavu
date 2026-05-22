@@ -140,6 +140,46 @@ def _check_install_status_marker(rep: Report) -> None:
                             detail=f"status={d.get('status')}"))
 
 
+def _check_repo_identity(cfg: dict, rep: Report) -> None:
+    """Verify cwd resolves to a stable repo_id; flag missing git root.
+
+    Three outcomes:
+      ok:    resolver returned a UUID + the resolved root is a git repo
+             (or has a pre-existing .dejavu/id from a previous resolve).
+      warn:  resolver fell back to cwd because no .git was found above.
+      fail:  .dejavu/id exists but is malformed.
+      skip:  repo_id module not importable (defensive — should never
+             happen in a working install).
+    """
+    try:
+        import repo_id as _rid
+    except Exception as e:
+        rep.add(CheckResult(
+            "repo_identity", "skip",
+            detail=f"could not import repo_id module: {e}"))
+        return
+    try:
+        rid, rroot = _rid.resolve(start=Path.cwd())
+    except _rid.MalformedRepoIdError as e:
+        rep.add(CheckResult(
+            "repo_identity", "fail",
+            detail=f"malformed .dejavu/id: {e}",
+            fix="Inspect <repo_root>/.dejavu/id; delete it to regenerate.",
+        ))
+        return
+    # Was the repo root the same as cwd AND no .git above it?
+    if rroot.resolve() == Path.cwd().resolve() and not (rroot / ".git").exists():
+        rep.add(CheckResult(
+            "repo_identity", "warn",
+            detail=f"no git root above cwd; using cwd as repo boundary ({rid})",
+            fix="If this isn't intended, cd into a git repo and re-run.",
+        ))
+        return
+    rep.add(CheckResult(
+        "repo_identity", "ok",
+        detail=f"{rroot.name} ({rid})"))
+
+
 def _check_venv(rep: Report) -> Path | None:
     venv_dir = _data_root() / "venv"
     candidates = [
@@ -492,7 +532,9 @@ def _check_perf_class(cfg: dict, rep: Report) -> None:
     if not perf or perf == "untested":
         rep.add(CheckResult(
             "perf_class", "skip",
-            detail="not yet benchmarked — run `claude-dejavu bench --apply`",
+            detail="not yet benchmarked — run `python "
+                    "${CLAUDE_DEJAVU_PLUGIN_ROOT:-$(claude-dejavu about "
+                    "--plugin-root)}/code/bench_local.py --apply`",
         ))
         return
 
@@ -800,10 +842,282 @@ def _check_hooks_wiring(rep: Report) -> None:
         rep.add(CheckResult("hooks", "ok", detail=f"{len(have)} events wired"))
 
 
+# ─── v0.8.0 — session-copy health section (spec §3.4) ──────────────────────
+
+
+def _check_session_copy(rep: Report) -> None:
+    """Four checks on the v0.8.0 restic-backed session-copy subsystem:
+
+      1. Repo reachable (read metadata via `session_copy.list_snapshots`)
+      2. Last-snapshot age < 48h (warn at > 48h; OK if < 24h)
+      3. Repo size under 20 GB (warn) / 50 GB (crit)
+      4. `restic check` clean — via session_copy.check(max_age_hours=24)
+
+    Lazy-imports session_copy so doctor still runs cleanly when restic
+    isn't installed yet — in that case we emit a single 'skip' note
+    instead of failing four separate checks.
+    """
+    data_root = _data_root()
+    repo_path = data_root / "restic-repo"
+    pass_file = data_root / ".restic-pass"
+    if not repo_path.is_dir() or not pass_file.is_file():
+        rep.add(CheckResult(
+            "session_copy", "skip",
+            detail="session-copy not configured (run "
+                    "`claude-dejavu session-copy init`)",
+            fix="claude-dejavu session-copy init"))
+        return
+
+    try:
+        sys.path.insert(0, str(_plugin_root() / "code"))
+        import session_copy  # type: ignore[import]
+    except ImportError as exc:
+        rep.add(CheckResult(
+            "session_copy", "fail",
+            detail=f"session_copy module unavailable: {exc}",
+            fix="re-run scripts/install.py"))
+        return
+
+    spec = session_copy.RepoSpec(
+        repo_path=repo_path,
+        passphrase_file=pass_file,
+        bin_path=data_root / "bin" / "restic",
+    )
+
+    # Check 1 + 2 + 3 via session_copy.status() (it calls list_snapshots
+    # internally, which doubles as the reachable probe).
+    try:
+        st = session_copy.status(spec)
+    except Exception as exc:
+        rep.add(CheckResult(
+            "session_copy.reachable", "fail",
+            detail=f"repo unreachable: {exc}",
+            fix="claude-dejavu session-copy check --force"))
+        return
+    rep.add(CheckResult(
+        "session_copy.reachable", "ok",
+        detail=f"{st['snapshot_count']} snapshot(s) at {st['repo_path']}"))
+
+    # Check 2 — last-snapshot age. Warn at > 48h (2× the default doctor
+    # cadence) given the legacy migration window may have just landed.
+    age_s = st.get("last_snapshot_age_s")
+    if age_s is None:
+        rep.add(CheckResult(
+            "session_copy.last_snapshot_age", "warn",
+            detail="no snapshots yet",
+            fix="claude-dejavu session-copy take"))
+    elif age_s > 48 * 3600:
+        rep.add(CheckResult(
+            "session_copy.last_snapshot_age", "warn",
+            detail=f"last snapshot was {age_s/3600:.1f}h ago (> 48h)",
+            fix="check scheduler: claude-dejavu doctor"))
+    else:
+        rep.add(CheckResult(
+            "session_copy.last_snapshot_age", "ok",
+            detail=f"{age_s/3600:.1f}h ago"))
+
+    # Check 3 — repo size threshold (warn at > 20 GB, crit at > 50 GB).
+    size_bytes = st.get("repo_size") or 0
+    size_gb = size_bytes / (1024 ** 3)
+    if size_gb > 50:
+        rep.add(CheckResult(
+            "session_copy.repo_size", "fail",
+            detail=f"repo size {size_gb:.1f} GB > 50 GB threshold",
+            fix="claude-dejavu session-copy prune"))
+    elif size_gb > 20:
+        rep.add(CheckResult(
+            "session_copy.repo_size", "warn",
+            detail=f"repo size {size_gb:.1f} GB > 20 GB",
+            fix="claude-dejavu session-copy prune --dry-run"))
+    else:
+        rep.add(CheckResult(
+            "session_copy.repo_size", "ok",
+            detail=f"{size_gb:.2f} GB"))
+
+    # Check 4 — `restic check`, cached to 24h (max_age_hours=24).
+    try:
+        r = session_copy.check(spec, max_age_hours=24, force=False)
+    except Exception as exc:
+        rep.add(CheckResult(
+            "session_copy.check", "fail",
+            detail=f"restic check raised: {exc}",
+            fix="claude-dejavu session-copy check --force"))
+        return
+    if r.get("ok"):
+        rep.add(CheckResult(
+            "session_copy.check", "ok",
+            detail=("cached" if r.get("cached") else "ran") + " — clean"))
+    else:
+        rep.add(CheckResult(
+            "session_copy.check", "fail",
+            detail=f"restic check FAILED:\n{(r.get('output') or '')[:300]}",
+            fix="claude-dejavu session-copy check --force"))
+
+
+# ─── v0.8.2: Weaviate shard rescue-pending probe ───────────────────────
+
+
+def _check_weaviate_shard_health(cfg: dict, rep: Report) -> None:
+    """Probe Weaviate's /v1/nodes endpoint for shards in an unloaded /
+    error state. When any class has a sick shard, surface a `rescue:
+    pending — run claude-dejavu rescue-shard --class <C>` warning.
+
+    Skipped if WV_URL isn't configured or Weaviate isn't reachable
+    (the _check_weaviate gate already surfaces that as a fail).
+    """
+    url = cfg.get("WV_URL")
+    if not url:
+        return
+    try:
+        req = urllib.request.Request(f"{url}/v1/nodes")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read())
+    except Exception:  # noqa: BLE001
+        # Don't double-report — _check_weaviate already covered this.
+        return
+
+    sick_classes: set[str] = set()
+    nodes = data.get("nodes") or []
+    for node in nodes:
+        shards = node.get("shards") or []
+        for sh in shards:
+            status = (sh.get("status") or "").upper()
+            cls = sh.get("class") or sh.get("className") or ""
+            if not cls:
+                continue
+            # READY / INDEXING are healthy. Anything else (UNLOADED,
+            # READONLY, FROZEN_UPLOAD_FAILED, etc.) is suspect.
+            if status and status not in ("READY", "INDEXING"):
+                sick_classes.add(cls)
+    if not sick_classes:
+        rep.add(CheckResult(
+            "weaviate_shards", "ok",
+            detail=f"all shards across {len(nodes)} node(s) READY"))
+        return
+
+    for cls in sorted(sick_classes):
+        rep.add(CheckResult(
+            f"weaviate_shards.{cls}", "fail",
+            detail=f"one or more shards in class {cls!r} are not READY",
+            fix=f"rescue: pending — run "
+                f"`claude-dejavu rescue-shard --class {cls} --dry-run` "
+                f"first to inspect, then re-run without --dry-run to apply"))
+
+
 # ─── Public entry points ───────────────────────────────────────────────────
 
 
-def run_doctor(verbose: bool = False) -> Report:
+def _check_pg_rescue_deep(rep: Report) -> None:
+    """v0.8.3 — invoke pg_rescue.scan() and surface corrupt rows + indexes.
+
+    Each finding includes the exact ``pg-rescue`` command that fixes it.
+    Used only when ``run_doctor(deep=True)``.
+    """
+    try:
+        sys.path.insert(0, str(_plugin_root() / "code"))
+        import pg_rescue as _pg  # type: ignore[import]
+    except Exception as exc:
+        rep.add(CheckResult("pg_rescue_scan", "skip",
+                              detail=f"pg_rescue module unavailable: {exc}"))
+        return
+    try:
+        r = _pg.scan()
+    except Exception as exc:
+        rep.add(CheckResult("pg_rescue_scan", "warn",
+                              detail=f"scan failed: {exc}",
+                              fix="claude-dejavu doctor (re-run with PG up)"))
+        return
+    n_rows = len(r.get("corrupt_rows", []))
+    n_idx = len(r.get("corrupt_indexes", []))
+    n_pages = len(r.get("corrupt_pages", []))
+    if n_rows == 0 and n_idx == 0 and n_pages == 0:
+        rep.add(CheckResult("pg_rescue_scan", "ok",
+                              detail=(f"probed {r.get('probed_rows', 0)} "
+                                          f"rows, no corruption")))
+        return
+    detail_parts = []
+    if n_rows:
+        detail_parts.append(f"{n_rows} corrupt row(s)")
+    if n_idx:
+        detail_parts.append(f"{n_idx} invalid index(es)")
+    if n_pages:
+        detail_parts.append(f"{n_pages} unreadable table(s)")
+    rep.add(CheckResult(
+        "pg_rescue_scan", "fail",
+        detail="; ".join(detail_parts),
+        fix=("claude-dejavu pg-rescue patch-toast --yes  "
+              "# if corrupt rows are turns.content TOAST chunks\n"
+              "claude-dejavu pg-rescue reindex --yes  "
+              "# if indexes are invalid\n"
+              "claude-dejavu pg-rescue rebuild-table <table> --yes  "
+              "# last resort for irreparable rows"),
+    ))
+
+
+def _check_weaviate_rescue_deep(rep: Report) -> None:
+    """v0.8.3 — invoke weaviate_rescue.scan() to surface dim mismatches +
+    unhealthy shards + missing classes."""
+    try:
+        sys.path.insert(0, str(_plugin_root() / "code"))
+        import weaviate_rescue as _wv  # type: ignore[import]
+    except Exception as exc:
+        rep.add(CheckResult("weaviate_rescue_scan", "skip",
+                              detail=f"weaviate_rescue unavailable: {exc}"))
+        return
+    try:
+        r = _wv.scan()
+    except Exception as exc:
+        rep.add(CheckResult("weaviate_rescue_scan", "warn",
+                              detail=f"scan failed: {exc}",
+                              fix="claude-dejavu doctor (re-run with WV up)"))
+        return
+    # why: scan() catches its own network errors and returns
+    # {reachable: False, ...} with the rest of the fields as defaults
+    # (zero-length lists, embed_dim=None). Without this guard the
+    # caller misreads "no unhealthy_shards listed" as "all shards
+    # READY". Caught in 2026-05-18 hell test H4: doctor falsely
+    # reported `✓ weaviate_rescue_scan all shards READY` while
+    # Weaviate was stopped.
+    if not r.get("reachable", False):
+        rep.add(CheckResult(
+            "weaviate_rescue_scan", "fail",
+            detail="Weaviate unreachable — scan could not run",
+            fix="start the Weaviate container, then re-run "
+                "`claude-dejavu doctor --deep`"))
+        return
+    issues: list[str] = []
+    fix_parts: list[str] = []
+    if r.get("dim_mismatches"):
+        for dm in r["dim_mismatches"]:
+            issues.append(
+                f"{dm['class']} at {dm['actual']}-dim (cloud emits "
+                f"{dm['expected']}-dim)")
+            fix_parts.append(
+                f"claude-dejavu weaviate-rescue redo-class "
+                f"{dm['class']} --reset-pg-flags --yes")
+    if r.get("unhealthy_shards"):
+        for sh in r["unhealthy_shards"]:
+            issues.append(
+                f"shard {sh['shard']} of {sh['class']} status="
+                f"{sh['status']}")
+            fix_parts.append(
+                f"claude-dejavu rescue-shard --class {sh['class']} "
+                f"--shard {sh['shard']}")
+    if r.get("missing_classes"):
+        issues.append(f"missing classes: {r['missing_classes']}")
+    if not issues:
+        rep.add(CheckResult(
+            "weaviate_rescue_scan", "ok",
+            detail=f"all shards READY, embed_dim={r.get('embed_dim')}"))
+        return
+    rep.add(CheckResult(
+        "weaviate_rescue_scan", "fail",
+        detail="; ".join(issues),
+        fix="\n".join(fix_parts) if fix_parts else "",
+    ))
+
+
+def run_doctor(verbose: bool = False, deep: bool = False) -> Report:
     rep = Report(plugin_version=_plugin_version())
     cfg = _load_cfg()
     _check_install_status_marker(rep)
@@ -813,14 +1127,22 @@ def run_doctor(verbose: bool = False) -> Report:
                             detail="skipping (install incomplete)"))
         return rep
     _check_venv(rep)
+    _check_repo_identity(cfg, rep)
     _check_postgres(cfg, rep)
     _check_weaviate(cfg, rep)
+    _check_weaviate_shard_health(cfg, rep)
     _check_symbol_index(cfg, rep)
     _check_ingest_coverage(cfg, rep)
     _check_perf_class(cfg, rep)
     _check_cloud_embed(cfg, rep)
     _check_hooks_wiring(rep)
+    _check_session_copy(rep)
     _check_error_log(rep)
+    if deep:
+        # v0.8.3 — destructive diagnostics that walk every row + every
+        # shard. Disabled by default because they're slow on large DBs.
+        _check_pg_rescue_deep(rep)
+        _check_weaviate_rescue_deep(rep)
     return rep
 
 

@@ -222,6 +222,186 @@ If the list is still empty after sessions have run:
 - Check the off-tree dir: `ls ~/.local/share/claude-dejavu/chat-logs/`
   (Linux) — should contain mirrored `.jsonl` files.
 
+### "`pg-rescue scan` reports `corrupt_rows`"
+
+`claude-dejavu pg-rescue scan` walks every row of `turns`,
+`tool_calls`, and `observations`, probing content via `length()` +
+`substring()`. Any row whose probe raises a TOAST decompression error
+or returns NULL-where-NOT-NULL is reported as `corrupt_rows`.
+
+The standard remediation is `patch-toast`, which re-derives the
+canonical content from the source JSONL (using `sessions.project_path`
++ `turns.message_uuid`) and `UPDATE`s with a per-row `SAVEPOINT` so one
+bad row doesn't kill the batch.
+
+```bash
+# Take a snapshot first — destructive operations require it.
+claude-dejavu session-copy take --tag pre-pg-rescue --include all
+
+# See exactly what's broken
+claude-dejavu pg-rescue scan --json
+
+# Dry-run patch (default)
+claude-dejavu pg-rescue patch-toast
+
+# Apply
+claude-dejavu pg-rescue patch-toast --yes
+
+# If indexes are also invalid
+claude-dejavu pg-rescue reindex --yes
+```
+
+If `UPDATE` itself errors on a row (corrupt heap tuple header — torn
+xmin/xmax), use `rebuild-table` instead:
+
+```bash
+claude-dejavu pg-rescue rebuild-table turns \
+    --exclude-ids 119271,119272 \
+    --replace-from-jsonl --yes
+```
+
+This does a filtered index-scan rebuild: drops dependents (FKs + views
+discovered at runtime via `pg_catalog`), copies all rows except the
+excluded ids, optionally INSERTs JSONL-recovered replacements, atomic
+swap, recreates dependents.
+
+### "`pg-rescue scan` reports `schema_mismatches`"
+
+This isn't corruption — it's drift detection. The scanner validates
+every probe column against `information_schema.columns` before
+probing. When a column the scanner expects (e.g. `tool_calls.input`)
+doesn't match the live schema (the column is actually `tool_input`,
+JSONB), the mismatch is surfaced under `schema_mismatches` instead of
+being counted as a corrupt row.
+
+If you see this, your dejavu schema has drifted from what
+`code/pg_rescue.py` expects. Likely causes:
+
+- You're on a forked schema (patched the .sql by hand).
+- A migration ran but the rescue toolkit hasn't been updated yet.
+
+If you're on `main` and seeing mismatches, that's a bug — file an
+issue with the `--json` output. The v0.8.3 release of `pg-rescue`
+fixed three drift cases (`tool_calls.input` → `tool_input`,
+`tool_calls.result` → `tool_output`, `observations.observation` →
+`title`/`subtitle`), so a stale plugin cache pre-0.8.3 is the most
+likely cause.
+
+### "`weaviate-rescue scan` reports shard issues"
+
+`claude-dejavu weaviate-rescue scan` probes `/v1/nodes`, `/v1/schema`,
+and vector-dimension consistency between the configured cloud
+embedding endpoint and each class's stored vectors. Common findings:
+
+| Finding | Remediation |
+|---|---|
+| Shard not in `READY` / `INDEXING` state | `claude-dejavu rescue-shard --class <C>` (v0.8.2 — Go segment reader + class reset + gap-reindex). Take a `session-copy take --include all` first. |
+| Vector-dim mismatch (e.g. configured 1024-dim cloud embed, existing class is 384-dim) | `claude-dejavu weaviate-rescue redo-class ClaudeDejavuTurn --reset-pg-flags --yes` then bootstrap the ingester to re-embed at the new dim. |
+| LSM segment file corrupted | `claude-dejavu weaviate-rescue quarantine-segment <id> --class <C> --shard <S> --yes` moves the 5 files (`.db`, `.bloom`, `.cna`, `.secondary.0.bloom`, `.secondary.1.bloom`) into `$DATA_ROOT/weaviate-quarantine/<ts>/`. Stops + restarts Weaviate around the move. Follow with `rescue-shard` to recover records from the quarantined segment without re-embedding. |
+| Missing canonical class | re-run `scripts/install.py` to recreate `ClaudeDejavuTurn` + `ClaudeDejavuDoc`. |
+
+### "`doctor --deep` reports WARN / FAIL"
+
+`claude-dejavu doctor --deep` (v0.8.3) extends the standard health
+check with `pg-rescue scan` + `weaviate-rescue scan`. It's opt-in
+because both scans are slow on large DBs (full row-by-row probe).
+
+Each surfaced issue includes the **exact remediation command** to
+paste. Read the `→ fix:` line — that's the single-line fix path.
+
+`WARN` is "you can keep using dejavu but should fix this soon";
+`FAIL` is "you have data corruption / unreachable backend, do the fix
+before depending on results". Both are non-blocking — `doctor` itself
+exits 0 either way; check the body, not the exit code.
+
+### "`dejavu_bridge unavailable; running in standard mode`"
+
+The closed-source `dejavu_bridge` Python wheel isn't installed. This is
+expected when `DEJAVU_BRIDGE_INDEX_URL` wasn't set at install time.
+You get an in-tree Python stub that re-exposes the same six retrieval
+primitives with naive deterministic semantics — the full test suite
+passes against the stub, and recall keeps working.
+
+What you lose in STANDARD MODE:
+
+- Gist quality drops from anchor-preserving compression to
+  first-paragraph-ish.
+- `claude-dejavu search` falls back to `content[:200]` for any row
+  where `gist IS NULL` — fine, but uses more tokens.
+- JIT recall (`hooks/user_prompt_submit.py`) falls back from greedy
+  token-budget fill to fixed top-N truncation.
+
+To install the wheel:
+
+```bash
+# Point at a directory / URL with the wheel artifact
+export DEJAVU_BRIDGE_INDEX_URL=file:///path/to/wheels/
+
+# Re-run the installer (idempotent — only step [4/9] actually does work)
+python3 scripts/install.py --auto
+```
+
+Confirm with `claude-dejavu doctor` (the bridge mode shows up under
+the venv check) and the SessionStart stderr line on next launch.
+
+### "JIT recall returns nothing"
+
+If `claude-dejavu jit-recall-preview "<prompt>"` prints empty output:
+
+1. **Check the prompt is long enough.** `JIT_RECALL_MIN_PROMPT_CHARS`
+   (default `40`) silently skips short prompts.
+2. **Check the BM25 score threshold.** `JIT_RECALL_SCORE_THRESHOLD`
+   defaults to `2.0` on BM25's 1-20+ range (NOT 0-1 cosine). If you
+   manually set it to `0.6` (cosine-flavored), every real hit is
+   silently rejected — that's exactly the bug the v0.8.5 retune
+   fixed. Reset to `2.0` (or remove the line).
+3. **Check past sessions have data on the topic.** JIT recall searches
+   the live `ClaudeDejavuTurn` corpus via BM25 keyword extraction. If
+   the topic genuinely doesn't appear in past sessions, no hits is
+   correct.
+4. **Check the backend.** `claude-dejavu doctor` must report PG + WV
+   green; the hook is defensive and silent-zeros on backend failure.
+
+### "`migrate-from-rsync` crashed mid-flight"
+
+The migration is **idempotent + resumable** via a phase marker at
+`$DATA_ROOT/migration-state.json`. Re-run `scripts/install.py` (or
+the underlying `claude-dejavu session-copy migrate-from-rsync`
+command) and it picks up at the last completed phase.
+
+The 10 phases: `stop legacy → inventory → preserve → init repo →
+initial snapshot → verify → install scheduler disabled → atomic
+rename → enable scheduler → done`. Per-step rollback contracts mean
+a crash in any phase leaves the system in a known state.
+
+`hooks/session_start.py` surfaces a migration-pending notice when the
+state file exists with `phase != 'done'`, so you'll see a warning in
+chat next time you launch Claude Code.
+
+### "I have a 513 GB `.deleteme` tree eating my disk"
+
+That's the `migrate-from-rsync` safety net — the old
+`~/.claude-backups/snapshots/` chain renamed to
+`~/.claude-backups/snapshots.deleteme.<ts>/` so you can roll back if
+the new restic repo turns out wrong.
+
+Once you've verified the restic repo (`claude-dejavu session-copy
+list`, `… diff`, `… restore` on a known snapshot to a temp dir):
+
+```bash
+# Preview (size + path)
+claude-dejavu session-copy reclaim-legacy --dry-run
+
+# Apply (TTY-guarded + typed confirmation phrase; --yes skips the typing)
+claude-dejavu session-copy reclaim-legacy --yes
+```
+
+The 2026-05-15 incident that motivated v0.8.0 had 5,057 unbounded rsync
+snapshots × ~100 MB each = 508 GB on a single root partition.
+`reclaim-legacy` brings that back to the ~5-10 GB the new policy
+targets (24 hourly + 7 daily + 13 weekly retention, content-addressed
+dedup, zstd compression).
+
 ### "Reindex is slow"
 
 Expected for first run on a large project — symbol indexing walks
@@ -338,7 +518,21 @@ Issues: <https://github.com/HthSolid/claude-dejavu/issues>
 ```bash
 # Health
 claude-dejavu doctor                                # full check
+claude-dejavu doctor --deep                          # + pg-rescue scan + weaviate-rescue scan (slow)
 claude-dejavu doctor --json                          # for scripting
+
+# Rescue toolkits (v0.8.2 + v0.8.3)
+claude-dejavu pg-rescue scan --json                  # PG corruption diagnostic
+claude-dejavu pg-rescue patch-toast --yes            # repair from JSONL
+claude-dejavu pg-rescue rebuild-table <t> --yes      # heap rebuild
+claude-dejavu weaviate-rescue scan --json            # WV shard + dim diagnostic
+claude-dejavu rescue-shard --class ClaudeDejavuTurn  # recover from torn LSM segments
+
+# Session-copy (v0.8.0 — restic-backed)
+claude-dejavu session-copy take --tag manual         # ad-hoc snapshot
+claude-dejavu session-copy list --last 20            # what's restorable
+claude-dejavu session-copy status                    # size + last-snapshot age
+claude-dejavu session-copy reclaim-legacy --yes      # delete legacy .deleteme tree
 
 # Logs
 claude-dejavu logs                                   # last 30 errors
